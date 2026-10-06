@@ -1,5 +1,4 @@
-//! Layout and actions. Laid out like grin's TUI: a title bar, a menu on the left, and one panel
-//! at a time on the right.
+//! Layout and actions: a title bar, a menu on the left, and one panel at a time on the right.
 
 use crate::config::{self, ConfigFile};
 use crate::node;
@@ -34,6 +33,7 @@ pub struct App {
     pub rpc: Rpc,
     pub service: String,
     pub argv: Vec<String>,
+    pub log_desc: String,
     pub pending: Arc<Mutex<Option<Pending>>>,
     pub want_logs: Arc<AtomicBool>,
     pub panel: Arc<Mutex<String>>,
@@ -51,11 +51,12 @@ impl App {
         rpc: Rpc,
         service: String,
         argv: Vec<String>,
+        log_desc: String,
         pending: Arc<Mutex<Option<Pending>>>,
         want_logs: Arc<AtomicBool>,
         panel: Arc<Mutex<String>>,
     ) -> Self {
-        Self { snap, cfg, rpc, service, argv, pending, want_logs, panel, log_filter: 0, hide_noise: true, last_roster: Vec::new(), last_bonds: Vec::new() }
+        Self { snap, cfg, rpc, service, argv, log_desc, pending, want_logs, panel, log_filter: 0, hide_noise: true, last_roster: Vec::new(), last_bonds: Vec::new() }
     }
 }
 
@@ -225,7 +226,8 @@ fn confirm_quit(s: &mut Cursive) {
 pub fn refresh(s: &mut Cursive) {
     let a = app(s);
     let snap = a.snap.lock().unwrap().clone();
-    let (service, rpc_url, argv, filter, hide) = (a.service.clone(), a.rpc.url.clone(), a.argv.clone(), a.log_filter, a.hide_noise);
+    let (service, rpc_url, argv, filter, hide, log_desc) =
+        (a.service.clone(), a.rpc.url.clone(), a.argv.clone(), a.log_filter, a.hide_noise, a.log_desc.clone());
     let (config_path, threads, dirty) = {
         let c = a.cfg.lock().unwrap();
         (c.path.display().to_string(), c.get_int(&["mining", "internal_miner_threads"]), c.dirty)
@@ -257,7 +259,7 @@ pub fn refresh(s: &mut Cursive) {
         "config" => set_text(s, "config_status", config_status(&config_path, dirty)),
         "control" => set_text(s, "control_text", render::node_control(&snap, &service)),
         "logs" => set_text(s, "logs_text", render::logs(&snap, filter, hide)),
-        "version" => set_text(s, "version_text", render::version(&snap, &service, &config_path, &rpc_url, &argv)),
+        "version" => set_text(s, "version_text", render::version(&snap, &service, &config_path, &rpc_url, &argv, &log_desc)),
         _ => {}
     }
 }
@@ -828,6 +830,9 @@ fn save_config(s: &mut Cursive) -> bool {
 }
 
 fn saved_offer_restart(s: &mut Cursive) {
+    if !app(s).snap.lock().unwrap().managed {
+        return info(s, "Saved", "Config saved (previous version kept as a .bak file). Restart zebrad so it takes effect.");
+    }
     s.add_layer(
         Dialog::text("Config saved (previous version kept as a .bak file).\nRestart the node now so it takes effect?")
             .title("Saved")
@@ -846,7 +851,7 @@ fn saved_offer_restart(s: &mut Cursive) {
 
 fn open_editor(s: &mut Cursive) {
     let go = |s: &mut Cursive| {
-        let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "nano".into());
+        let editor = node::default_editor();
         let path = app(s).cfg.lock().unwrap().path.display().to_string();
         let mut cmd: Vec<String> = editor.split_whitespace().map(String::from).collect();
         cmd.push(path);
@@ -901,7 +906,18 @@ fn confirm(s: &mut Cursive, question: &str, then: fn(&mut Cursive)) {
     );
 }
 
+fn managed(s: &mut Cursive) -> bool {
+    let m = app(s).snap.lock().unwrap().managed;
+    if !m {
+        info(s, "Node control", "The node is not running as a systemd service, so the TUI cannot start, stop or restart it. Do that where you run zebrad.");
+    }
+    m
+}
+
 fn run_sudo(s: &mut Cursive, op: &str) {
+    if !managed(s) {
+        return;
+    }
     let service = app(s).service.clone();
     let cmd = ["sudo", "systemctl", op, &service].iter().map(|x| x.to_string()).collect();
     *app(s).pending.lock().unwrap() = Some(Pending { cmd, reload_config: false });
@@ -909,6 +925,9 @@ fn run_sudo(s: &mut Cursive, op: &str) {
 }
 
 fn quick_restart(s: &mut Cursive) {
+    if !managed(s) {
+        return;
+    }
     let (pid, policy) = {
         let snap = app(s).snap.lock().unwrap();
         (snap.service.get("MainPID").cloned().unwrap_or_default(), snap.service.get("Restart").cloned().unwrap_or_default())

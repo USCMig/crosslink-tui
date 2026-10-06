@@ -1,4 +1,4 @@
-//! Terminal front end for a Crosslink (zebrad) node, modelled on grin's node TUI.
+//! Terminal front end for a Crosslink (zebrad) node.
 //!
 //! It only uses what the node already exposes: JSON-RPC, the systemd unit, the journal and the
 //! config file. Nothing in the node is changed.
@@ -15,12 +15,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "crosslink-tui [--service NAME] [--config PATH] [--rpc URL]
+const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--log-file PATH] [--service NAME]
 
-  --service NAME  systemd unit running zebrad (default: zebra-crosslink)
-  --config PATH   zebrad.toml to manage (default: the -c path in the unit's ExecStart,
-                  else ~/.config/zebrad.toml)
-  --rpc URL       node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
+  --config PATH    zebrad.toml to manage (default: the -c path in the systemd unit's ExecStart,
+                   else zebrad's default location for this OS)
+  --rpc URL        node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
+  --log-file PATH  read node logs from this file (default on Linux: the unit's journal)
+  --service NAME   systemd unit running zebrad, Linux only (default: zebra-crosslink)
 
 Works in any terminal, including tmux:  tmux new -A -s crosslink crosslink-tui";
 
@@ -28,12 +29,14 @@ fn main() {
     let mut service = "zebra-crosslink".to_string();
     let mut config_arg = None;
     let mut rpc_arg = None;
+    let mut log_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--service" => service = args.next().unwrap_or_else(|| usage_exit()),
             "--config" => config_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--rpc" => rpc_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--log-file" => log_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage_exit()))),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -42,11 +45,17 @@ fn main() {
         }
     }
 
-    let argv = node::exec_argv(&node::service_props(&service));
+    let props = node::service_props(&service);
+    let argv = node::exec_argv(&props);
+    let log_source = match log_file {
+        Some(p) => node::LogSource::File(p),
+        None if node::is_managed(&props) => node::LogSource::Journal(service.clone()),
+        None => node::LogSource::None,
+    };
     let config_path = config_arg
         .or_else(|| node::config_path_from_argv(&argv))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/zebrad.toml"));
+        .unwrap_or_else(node::default_config_path);
     let cfg = match config::ConfigFile::load(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -76,6 +85,7 @@ fn main() {
             rpc::Rpc::new(&rpc_url),
             service.clone(),
             argv.clone(),
+            log_source.describe(),
             pending.clone(),
             want_logs.clone(),
             panel.clone(),
@@ -86,6 +96,7 @@ fn main() {
         let poller = poll::Poller {
             rpc: rpc::Rpc::new(&rpc_url),
             service: service.clone(),
+            log_source: log_source.clone(),
             cache_dir: cache_dir.clone(),
             snap: snap.clone(),
             want_logs: want_logs.clone(),

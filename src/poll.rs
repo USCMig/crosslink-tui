@@ -30,6 +30,8 @@ pub struct Snap {
     pub bft_stats: Value,
     pub bft_block: Value,
     pub service: HashMap<String, String>,
+    /// A service manager (systemd) runs the node, so start/stop/status apply.
+    pub managed: bool,
     pub logs: Vec<String>,
     pub disk_bytes: Option<u64>,
     pub finalizer_address: Option<String>,
@@ -47,6 +49,7 @@ impl Snap {
 pub struct Poller {
     pub rpc: Rpc,
     pub service: String,
+    pub log_source: node::LogSource,
     pub cache_dir: Option<String>,
     pub snap: Arc<Mutex<Snap>>,
     pub want_logs: Arc<AtomicBool>,
@@ -63,6 +66,7 @@ impl Poller {
         while !stop.load(Ordering::Relaxed) {
             let mut s = self.snap.lock().unwrap().clone();
             s.service = node::service_props(&self.service);
+            s.managed = node::is_managed(&s.service);
 
             if last_disk.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
                 if let Some(dir) = &self.cache_dir {
@@ -79,9 +83,9 @@ impl Poller {
             if due && !lookup_busy.swap(true, Ordering::Relaxed) {
                 last_pid = pid;
                 last_lookup = Some(Instant::now());
-                let (service, found, busy) = (self.service.clone(), found.clone(), lookup_busy.clone());
+                let (src, found, busy) = (self.log_source.clone(), found.clone(), lookup_busy.clone());
                 std::thread::spawn(move || {
-                    let r = (node::finalizer_address(&service), node::running_solvers(&service));
+                    let r = (node::finalizer_address(&src), node::running_solvers(&src));
                     *found.lock().unwrap() = r;
                     busy.store(false, Ordering::Relaxed);
                 });
@@ -96,7 +100,7 @@ impl Poller {
 
             self.fetch_rpc(&mut s);
             if self.want_logs.load(Ordering::Relaxed) {
-                s.logs = node::journal(&self.service, LOG_LINES);
+                s.logs = node::log_lines(&self.log_source, LOG_LINES);
             }
             s.updated = Some(chrono::Local::now());
             *self.snap.lock().unwrap() = s;

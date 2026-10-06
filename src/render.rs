@@ -59,7 +59,7 @@ fn line(out: &mut String, label: &str, value: impl AsRef<str>) {
 }
 
 pub fn status_word(snap: &Snap) -> String {
-    if !snap.node_active() {
+    if snap.managed && !snap.node_active() {
         let state = snap.service.get("ActiveState").map(String::as_str).unwrap_or("unknown");
         return format!("Node {state}");
     }
@@ -351,6 +351,19 @@ pub fn bft(snap: &Snap) -> String {
 
 pub fn node_control(snap: &Snap, service: &str) -> String {
     let mut o = String::new();
+    if !snap.managed {
+        line(&mut o, "Status", status_word(snap));
+        o.push_str(RULE);
+        let _ = writeln!(
+            o,
+            "\nNo systemd unit named `{service}` was found{}.\n\
+             Start, stop and restart need the node to run as a systemd service (Linux).\n\
+             Otherwise start and stop zebrad yourself; every other panel still works over RPC.\n\
+             Use --service NAME if the unit has a different name.",
+            if cfg!(target_os = "linux") { "" } else { " (systemd is Linux-only)" }
+        );
+        return o;
+    }
     let p = |k: &str| snap.service.get(k).cloned().unwrap_or_else(|| "-".into());
     line(&mut o, "Service", service);
     line(&mut o, "State", format!("{} ({})", p("ActiveState"), p("SubState")));
@@ -368,7 +381,7 @@ pub fn node_control(snap: &Snap, service: &str) -> String {
     o
 }
 
-pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[String]) -> String {
+pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[String], logs: &str) -> String {
     let mut o = String::new();
     line(&mut o, "TUI version", env!("CARGO_PKG_VERSION"));
     line(&mut o, "zebrad build", s(&snap.info, "build"));
@@ -379,6 +392,7 @@ pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[Stri
     line(&mut o, "Binary", argv.first().cloned().unwrap_or("-".into()));
     line(&mut o, "Config file", config);
     line(&mut o, "RPC", rpc);
+    line(&mut o, "Logs", logs);
     line(&mut o, "Unit file", snap.service.get("FragmentPath").cloned().unwrap_or("-".into()));
     line(&mut o, "Drop-ins", snap.service.get("DropInPaths").filter(|d| !d.is_empty()).cloned().unwrap_or("-".into()));
     line(&mut o, "My finalizer", snap.finalizer_address.as_deref().unwrap_or("-"));
