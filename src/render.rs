@@ -54,6 +54,25 @@ fn opt<T: ToString>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
+/// RPCs this TUI uses that the upstream v14 node release does not have. The README explains how to
+/// add them to a node build (node-patches/).
+pub const EXTRA_RPCS: [&str; 6] = [
+    "get_tfl_finality_status",
+    "get_tfl_quorum_status",
+    "get_tfl_round_diagnosis",
+    "get_tfl_bft_internal_stats",
+    "get_tfl_bft_block",
+    "get_wallet_sync_status",
+];
+
+fn lacks(snap: &Snap, rpc: &str) -> bool {
+    snap.missing_rpcs.contains(rpc)
+}
+
+fn lacks_note(rpc: &str) -> String {
+    format!("n/a: this node has no {rpc} RPC (not in the upstream v14 release; see the README)")
+}
+
 fn line(out: &mut String, label: &str, value: impl AsRef<str>) {
     let _ = writeln!(out, "{:<W$}{}", format!("{label}:"), value.as_ref());
 }
@@ -105,15 +124,24 @@ pub fn basic(snap: &Snap) -> String {
     o.push('\n');
     let fin_h = u(&snap.final_tip, "height");
     line(&mut o, "BFT Finalized Height", fin_h.map(|h| h.to_string()).unwrap_or("none yet".into()));
-    line(&mut o, "BFT Height / Round", format!("{} / {}", opt(u(&snap.finality, "bft_height")), opt(u(&snap.finality, "bft_round"))));
-    line(&mut o, "Finality Health", finality_health(&snap.finality));
+    if lacks(snap, "get_tfl_finality_status") {
+        line(&mut o, "BFT Height / Round", lacks_note("get_tfl_finality_status"));
+    } else {
+        line(&mut o, "BFT Height / Round", format!("{} / {}", opt(u(&snap.finality, "bft_height")), opt(u(&snap.finality, "bft_round"))));
+        line(&mut o, "Finality Health", finality_health(&snap.finality));
+    }
     o.push_str(RULE);
     o.push('\n');
     line(&mut o, "Transaction Pool Size", format!("{} ({} bytes)", opt(u(&snap.mempool, "size")), opt(u(&snap.mempool, "bytes"))));
     o.push_str(RULE);
     o.push('\n');
     let w = &snap.wallet;
-    line(&mut o, "Wallet Scan", format!("{} / {}", opt(u(w, "sync_height")), opt(u(w, "tip_height"))));
+    if snap.wallet_fallback {
+        line(&mut o, "Wallet Scan", lacks_note("get_wallet_sync_status"));
+        line(&mut o, "Balances from", "wallet_spendable_funds, wallet_staking_positions");
+    } else {
+        line(&mut o, "Wallet Scan", format!("{} / {}", opt(u(w, "sync_height")), opt(u(w, "tip_height"))));
+    }
     line(&mut o, "Transparent (mined)", zats(u(w, "user_unshielded_zats")));
     line(&mut o, "Shielded spendable", zats(u(w, "user_shielded_spendable_zats")));
     line(&mut o, "Shielded pending", zats(u(w, "user_shielded_pending_zats")));
@@ -155,7 +183,9 @@ pub fn peers(snap: &Snap) -> String {
     o.push('\n');
     let bft = snap.bft_stats.get("peers").and_then(Value::as_array).cloned().unwrap_or_default();
     let _ = writeln!(o, "BFT peers ({})\n", bft.len());
-    if bft.is_empty() {
+    if lacks(snap, "get_tfl_bft_internal_stats") {
+        let _ = writeln!(o, "{}", lacks_note("get_tfl_bft_internal_stats"));
+    } else if bft.is_empty() {
         o.push_str("None reported (BFT is not running on this node yet).\n");
     }
     for p in bft {
@@ -266,8 +296,20 @@ pub fn roster_rows(snap: &Snap) -> Vec<RosterRow> {
 pub fn bft(snap: &Snap) -> String {
     let mut o = String::new();
     let f = &snap.finality;
+    let missing: Vec<&str> = EXTRA_RPCS[..5].iter().copied().filter(|m| lacks(snap, m)).collect();
+    if !missing.is_empty() {
+        let _ = writeln!(
+            o,
+            "This node build lacks {} of the 5 BFT diagnostic RPCs this panel uses. They are not part of\n\
+             the upstream v14 release; the README's \"Adding the extra RPCs to your node\" section shows\n\
+             how to add them.\n{RULE}",
+            missing.len()
+        );
+    }
     o.push_str("Finality status (get_tfl_finality_status)\n");
-    if f.is_null() {
+    if lacks(snap, "get_tfl_finality_status") {
+        let _ = writeln!(o, "  {}", lacks_note("get_tfl_finality_status"));
+    } else if f.is_null() {
         o.push_str("  unavailable\n");
     } else {
         line(&mut o, "  Health", if f.get("healthy").and_then(Value::as_bool) == Some(true) { "healthy" } else { "NOT healthy" });
@@ -287,7 +329,9 @@ pub fn bft(snap: &Snap) -> String {
     o.push_str(RULE);
     o.push_str("\nQuorum (get_tfl_quorum_status)\n");
     let q = snap.quorum.as_array().cloned().unwrap_or_default();
-    if q.is_empty() {
+    if lacks(snap, "get_tfl_quorum_status") {
+        let _ = writeln!(o, "  {}", lacks_note("get_tfl_quorum_status"));
+    } else if q.is_empty() {
         o.push_str("  no active roster\n");
     } else {
         let _ = writeln!(o, "  {:<14} {:>16} {:>7} {:<7} {:>6} {:<5} {:<5}", "Finalizer", "Power", "Share", "Online", "Seen", "Prev", "Prec");
@@ -310,7 +354,9 @@ pub fn bft(snap: &Snap) -> String {
     o.push_str(RULE);
     o.push_str("\nRounds at current height (get_tfl_round_diagnosis)\n");
     let rounds = snap.rounds.as_array().cloned().unwrap_or_default();
-    if rounds.is_empty() {
+    if lacks(snap, "get_tfl_round_diagnosis") {
+        let _ = writeln!(o, "  {}", lacks_note("get_tfl_round_diagnosis"));
+    } else if rounds.is_empty() {
         o.push_str("  none\n");
     }
     for r in &rounds {
@@ -332,13 +378,19 @@ pub fn bft(snap: &Snap) -> String {
     o.push_str(RULE);
     o.push_str("\nInternal stats (get_tfl_bft_internal_stats)\n");
     let st = &snap.bft_stats;
-    line(&mut o, "  Rounds held / commit cache", format!("{} / {}", opt(u(st, "rounds_data_len")), opt(u(st, "recent_commit_round_cache_len"))));
-    line(&mut o, "  BFT blocks / index", format!("{} / {}", opt(u(st, "bft_blocks_len")), opt(u(st, "bft_block_index_len"))));
-    line(&mut o, "  BFT peers", st.get("peers").and_then(Value::as_array).map_or("-".into(), |p| p.len().to_string()));
+    if lacks(snap, "get_tfl_bft_internal_stats") {
+        let _ = writeln!(o, "  {}", lacks_note("get_tfl_bft_internal_stats"));
+    } else {
+        line(&mut o, "  Rounds held / commit cache", format!("{} / {}", opt(u(st, "rounds_data_len")), opt(u(st, "recent_commit_round_cache_len"))));
+        line(&mut o, "  BFT blocks / index", format!("{} / {}", opt(u(st, "bft_blocks_len")), opt(u(st, "bft_block_index_len"))));
+        line(&mut o, "  BFT peers", st.get("peers").and_then(Value::as_array).map_or("-".into(), |p| p.len().to_string()));
+    }
     o.push_str(RULE);
     o.push_str("\nBFT tip block (get_tfl_bft_block)\n");
     let b = &snap.bft_block;
-    if b.is_null() {
+    if lacks(snap, "get_tfl_bft_block") {
+        let _ = writeln!(o, "  {}", lacks_note("get_tfl_bft_block"));
+    } else if b.is_null() {
         o.push_str("  none yet\n");
     } else {
         line(&mut o, "  Height", opt(u(b, "height")));
@@ -396,6 +448,18 @@ pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[Stri
     line(&mut o, "Unit file", snap.service.get("FragmentPath").cloned().unwrap_or("-".into()));
     line(&mut o, "Drop-ins", snap.service.get("DropInPaths").filter(|d| !d.is_empty()).cloned().unwrap_or("-".into()));
     line(&mut o, "My finalizer", snap.finalizer_address.as_deref().unwrap_or("-"));
+    let missing: Vec<&str> = EXTRA_RPCS.iter().copied().filter(|m| lacks(snap, m)).collect();
+    line(
+        &mut o,
+        "Extra RPCs (not in v14)",
+        if snap.rpc_error.is_some() {
+            "unknown (RPC unreachable)".to_string()
+        } else if missing.is_empty() {
+            "all present".to_string()
+        } else {
+            format!("missing {} (see README)", missing.join(", "))
+        },
+    );
     o
 }
 

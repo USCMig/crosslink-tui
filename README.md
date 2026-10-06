@@ -70,11 +70,81 @@ when you start zebrad yourself, redirect its output, for example `zebrad start >
 
 ## Requirements
 
-- A Crosslink `zebrad` node with RPC enabled. The BFT Finality panel needs a node build that has
-  the `get_tfl_*` diagnostic RPCs; the other panels work without them.
+- A Crosslink `zebrad` node with RPC enabled. The upstream v14 release runs every panel; six of
+  the RPCs the TUI can use are extras that upstream v14 does not have (see the next section).
 - Linux service control: the node runs as a systemd unit (default name `zebra-crosslink`), and the
   user running the TUI can read its journal (for example, as a member of `adm` or
   `systemd-journal`).
+
+## Node RPCs
+
+These RPCs ship with the upstream v14 release (`ShieldedLabs/crosslink_monolith`, tag `v14`):
+`getinfo`, `getblockchaininfo`, `getblockheader`, `getmininginfo`, `getmempoolinfo`, `getpeerinfo`,
+`get_tfl_roster_zats`, `get_tfl_final_block_height_and_hash`, `wallet_staking_positions`,
+`wallet_spendable_funds` and `staking_command`.
+
+These six are **not part of the upstream v14 release**. The TUI uses them when the node has them, and
+otherwise says on screen which one is missing:
+
+| RPC | Used for | Without it |
+|---|---|---|
+| `get_tfl_finality_status` | Basic Status finality summary; BFT Finality health, heights, quorum power, diagnosis | Shown as not available |
+| `get_tfl_quorum_status` | BFT Finality: per-finalizer power, online state and votes | Shown as not available |
+| `get_tfl_round_diagnosis` | BFT Finality: proposal and vote state of each round | Shown as not available |
+| `get_tfl_bft_internal_stats` | BFT Finality internal stats; BFT peers in Peers and Sync | Shown as not available |
+| `get_tfl_bft_block` | BFT Finality: the BFT tip block | Shown as not available |
+| `get_wallet_sync_status` | Wallet scan height and balances | Balances come from `wallet_spendable_funds` and `wallet_staking_positions`; the scan height is not shown |
+
+Version Info lists which of the six the connected node is missing.
+
+## Adding the extra RPCs to your node
+
+[`node-patches/v14-extra-rpcs.patch`](node-patches/v14-extra-rpcs.patch) adds all six to a v14
+node. They only read state the node already keeps; the patch changes no consensus, networking or
+wallet behaviour. It touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`, and in
+`zebra-crosslink/`: `zebra-crosslink/src/lib.rs`, `zebra-rpc/src/methods.rs`,
+`zebra-state/src/crosslink.rs` and `zebra-state/src/new_network/bft.rs`.
+
+1. Get the v14 source, or go to your existing v14 checkout:
+
+   ```sh
+   git clone https://github.com/ShieldedLabs/crosslink_monolith
+   cd crosslink_monolith
+   git checkout v14
+   ```
+
+2. Apply the patch from the repository root. The check step changes nothing; it only reports
+   whether the patch fits:
+
+   ```sh
+   git apply --check /path/to/crosslink-tui/node-patches/v14-extra-rpcs.patch
+   git apply /path/to/crosslink-tui/node-patches/v14-extra-rpcs.patch
+   ```
+
+   If your checkout has its own changes in those files and the check fails, try
+   `git apply -3 ...`, which applies what it can and leaves conflict markers for you to resolve.
+
+3. Rebuild the node:
+
+   ```sh
+   cd zebra-crosslink
+   cargo build --release -p zebrad
+   ```
+
+4. Run the new `target/release/zebrad` in place of the old binary, with the same config, and
+   restart the node (for example from the TUI's Node Control panel). Your chain state and wallet
+   are untouched.
+
+5. Check it worked: Version Info should show `Extra RPCs (not in v14): all present`, or from a shell:
+
+   ```sh
+   curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"get_tfl_finality_status","params":[],"id":1}' \
+     http://127.0.0.1:8232
+   ```
+
+The patch is made for v14. A later node release may already include these RPCs, or may need the
+patch updated.
 
 ## Keys
 

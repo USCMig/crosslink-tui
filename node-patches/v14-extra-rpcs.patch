@@ -1,0 +1,962 @@
+Adds six read-only RPCs used by crosslink-tui to a Crosslink v14 node:
+
+  get_tfl_finality_status     finality health, BFT height/round/step, quorum power, diagnosis
+  get_tfl_quorum_status       per-finalizer voting power, online state and votes
+  get_tfl_round_diagnosis     per-round proposal and vote state at the current BFT height
+  get_tfl_bft_internal_stats  BFT state sizes and BFT peer list
+  get_tfl_bft_block           a decided BFT block (the tip by default)
+  get_wallet_sync_status      headless wallet scan height and balances
+
+Base: ShieldedLabs/crosslink_monolith tag v14 (commit eca0207c). Apply from the repository root:
+
+  git apply --check v14-extra-rpcs.patch && git apply v14-extra-rpcs.patch
+
+The RPCs only read state the node already keeps; they change no consensus, networking or
+wallet behaviour. Text above the first "diff --git" line is ignored by git apply.
+
+diff --git a/tenderlink/src/lib.rs b/tenderlink/src/lib.rs
+index f00b4dea..4149f167 100644
+--- a/tenderlink/src/lib.rs
++++ b/tenderlink/src/lib.rs
+@@ -479,7 +479,7 @@ impl Timeout {
+ 
+ 
+ const ROSTER_MAX_N: usize = zcash_primitives::bft::ACTIVE_ROSTER_MAX_N;
+-fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
++pub fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
+ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
+ 
+ // Tendermint line 28 needs 2f+1 prevotes for the value in the round the proposal cites, vr, not in the
+@@ -722,7 +722,7 @@ impl TMState {
+         self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
+     }
+ 
+-    fn f_from_n(n: u64) -> u64 {
++    pub fn f_from_n(n: u64) -> u64 {
+         (n - 1) / 3
+     }
+ 
+diff --git a/zebra-crosslink/zebra-crosslink/src/lib.rs b/zebra-crosslink/zebra-crosslink/src/lib.rs
+index b9908c7f..235d449a 100644
+--- a/zebra-crosslink/zebra-crosslink/src/lib.rs
++++ b/zebra-crosslink/zebra-crosslink/src/lib.rs
+@@ -783,6 +783,217 @@ async fn tfl_service_incoming_request(
+         }
+ 
+         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
++
++        // crosslink diagnostics
++        TFLServiceRequest::FinalityStatus => {
++            // Read the PoW tip before taking the internal lock: the BFT loop contends for it
++            // every tick, and this request must not hold it across an await.
++            let pow_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
++            {
++                val
++            } else {
++                None
++            };
++
++            let diag = zebra_state::new_network::bft::bft_diagnostics();
++            let recency = zebra_state::new_network::bft::bft_recency_status();
++            let (tfl_is_activated, bft_chain_len, final_snapshot) = {
++                let chain = zebra_state::new_network::bft::bft_chain().read().unwrap();
++                (chain.is_activated, chain.blocks.len() as u64, chain.bft_final_snapshot)
++            };
++            let now_utc = chrono::Utc::now().timestamp();
++
++            let total_power: u64 = diag.quorum_status.iter().map(|m| m.voting_power).sum();
++            let online_power: u64 = diag
++                .quorum_status
++                .iter()
++                .filter(|m| m.online)
++                .map(|m| m.voting_power)
++                .sum();
++            let quorum_threshold = if total_power == 0 {
++                0
++            } else {
++                let f = tenderlink::TMState::f_from_n(total_power);
++                if f == 0 { total_power } else { 2 * f + 1 }
++            };
++
++            let pow_tip_height = pow_tip.map(|(height, _hash)| height.0);
++            let finalized_height = final_snapshot.map(|(height, _hash)| height.0);
++            let finality_gap = match (pow_tip_height, finalized_height) {
++                (Some(tip), Some(fin)) => Some(tip.saturating_sub(fin)),
++                _ => None,
++            };
++            let secs_since_last_decision = diag.last_decision_utc.map(|t| now_utc - t);
++
++            // Thresholds for "worth telling the operator about". A BFT height normally decides
++            // in seconds, and finality normally trails the PoW chain by far less than the
++            // 100-block reorg limit, so both of these are quiet in healthy operation.
++            const STALL_SECS: i64 = 300;
++            const WIDE_FINALITY_GAP: u32 = 100;
++
++            let mut diagnosis = Vec::new();
++
++            if !tfl_is_activated {
++                diagnosis.push("TFL is not activated on this node yet".to_string());
++            }
++
++            if total_power == 0 {
++                diagnosis.push(
++                    "no active roster is visible: the BFT layer has not started, or this node \
++                     has not yet synced a roster"
++                        .to_string(),
++                );
++            } else if online_power < quorum_threshold {
++                let offline: Vec<&TFLQuorumMember> =
++                    diag.quorum_status.iter().filter(|m| !m.online).collect();
++                diagnosis.push(format!(
++                    "online voting power {} is below the {} needed to decide a block: {} of {} \
++                     finalizers have not been seen recently. Finality cannot advance until \
++                     enough of them come back.",
++                    online_power,
++                    quorum_threshold,
++                    offline.len(),
++                    diag.quorum_status.len(),
++                ));
++            }
++
++            if let Some(secs) = secs_since_last_decision {
++                if secs > STALL_SECS {
++                    diagnosis.push(format!(
++                        "no BFT block has been decided in {secs}s (stuck at height {})",
++                        recency.my_height,
++                    ));
++                }
++            }
++
++            // The single most common cause of a wedged round on an otherwise healthy node: the
++            // proposal is fine, but this node does not hold the PoW block it finalizes.
++            for rd in &diag.round_diagnosis {
++                if let Some(hash) = &rd.proposal_blocked_on_block {
++                    diagnosis.push(format!(
++                        "round {}.{} cannot validate its proposal: this node does not hold PoW \
++                         block {hash}. Check that PoW sync is advancing.",
++                        rd.height, rd.round,
++                    ));
++                }
++            }
++
++            // Rounds 1-4 are routine here (a height that needs a few rounds still decides
++            // promptly), so only a round count that indicates repeated failure is worth
++            // reporting -- a health check that fires on normal operation gets ignored.
++            const HIGH_ROUND: u32 = 5;
++            if recency.my_round >= HIGH_ROUND {
++                diagnosis.push(format!(
++                    "height {} is at round {}: earlier rounds repeatedly failed to decide",
++                    recency.my_height, recency.my_round,
++                ));
++            }
++
++            if let Some(gap) = finality_gap {
++                if gap > WIDE_FINALITY_GAP {
++                    diagnosis.push(format!(
++                        "finality trails the PoW chain by {gap} blocks",
++                    ));
++                }
++            }
++
++            Ok(TFLServiceResponse::FinalityStatus(TFLFinalityStatus {
++                now_utc,
++                bft_height: recency.my_height,
++                bft_round: recency.my_round,
++                bft_step: match recency.my_step {
++                    0 => "propose",
++                    1 => "prevote",
++                    _ => "precommit",
++                }
++                .to_string(),
++                bft_locked_round: recency.my_locked_round,
++                bft_valid_round: recency.my_valid_round,
++                bft_chain_len: bft_chain_len,
++                last_decision_utc: diag.last_decision_utc,
++                secs_since_last_decision,
++                pow_tip_height,
++                finalized_height,
++                finality_gap,
++                roster_n: diag.quorum_status.len(),
++                total_power,
++                online_power,
++                online_power_pct: if total_power == 0 {
++                    0.0
++                } else {
++                    100.0 * online_power as f64 / total_power as f64
++                },
++                quorum_threshold,
++                quorum_online: total_power > 0 && online_power >= quorum_threshold,
++                healthy: diagnosis.is_empty(),
++                diagnosis,
++            }))
++        }
++
++        TFLServiceRequest::QuorumStatus => {
++            Ok(TFLServiceResponse::QuorumStatus(zebra_state::new_network::bft::bft_diagnostics().quorum_status))
++        }
++
++        TFLServiceRequest::RoundDiagnosis => {
++            Ok(TFLServiceResponse::RoundDiagnosis(zebra_state::new_network::bft::bft_diagnostics().round_diagnosis))
++        }
++
++        TFLServiceRequest::BftInternalStats => {
++            let diag = zebra_state::new_network::bft::bft_diagnostics();
++            let chain = zebra_state::new_network::bft::bft_chain().read().unwrap();
++            Ok(TFLServiceResponse::BftInternalStats(TFLBftInternalStats {
++                rounds_data_len: diag.rounds_data_len,
++                recent_commit_round_cache_len: diag.commit_cache_len,
++                bft_blocks_len: chain.blocks.len(),
++                bft_block_index_len: chain.hash_to_height.len(),
++                peers: chain.peer_strings.clone(),
++            }))
++        }
++
++        TFLServiceRequest::BftBlockInfo(height) => {
++            let chain = zebra_state::new_network::bft::bft_chain().read().unwrap();
++            let tip_i = chain.blocks.len().saturating_sub(1);
++            let i = height.map_or(tip_i, |h| h as usize);
++
++            Ok(TFLServiceResponse::BftBlockInfo(
++                chain.blocks.get(i).filter(|block| !block.headers.is_empty()).map(|block| {
++                    // Signatures over a block live in its *child's* back-pointer; the tip's
++                    // are the only ones held separately.
++                    let signature_count = if i + 1 < chain.blocks.len() {
++                        chain.blocks[i + 1].previous_block_fat_ptr.signatures.len()
++                    } else {
++                        chain.fat_pointer_to_tip.signatures.len()
++                    };
++
++                    TFLBftBlockInfo {
++                        height: i as u64,
++                        // BFT block hashes are raw blake3, matching fat pointers.
++                        hash: block.blake3_hash().to_string(),
++                        version: block.version,
++                        header_count: block.headers.len(),
++                        // The PoW block this BFT block finalizes, in display order so it can be
++                        // passed straight to getblock.
++                        candidate_hash: Some(ZebBlockHash(block.snapshot_block_hash().0).to_string()),
++                        do_not_include_until_bc_height: block.do_not_include_until_bc_height,
++                        signature_count,
++                        hardfork_count: block.hardforks.len(),
++                    }
++                }),
++            ))
++        }
++
++        TFLServiceRequest::WalletSyncStatus => {
++            let s = *wallet::WALLET_SYNC_STATUS.lock().unwrap();
++            Ok(TFLServiceResponse::WalletSyncStatus(WalletSyncStatusSnapshot {
++                sync_height: s.sync_height,
++                tip_height: s.tip_height,
++                user_shielded_spendable_zats: s.user_shielded_spendable_zats,
++                user_shielded_pending_zats: s.user_shielded_pending_zats,
++                user_unshielded_zats: s.user_unshielded_zats,
++                staked_zats: s.staked_zats,
++                withdrawable_zats: s.withdrawable_zats,
++            }))
++        }
+     }
+ }
+ 
+diff --git a/zebra-crosslink/zebra-rpc/src/methods.rs b/zebra-crosslink/zebra-rpc/src/methods.rs
+index 7d7ebcc5..736c97f1 100644
+--- a/zebra-crosslink/zebra-rpc/src/methods.rs
++++ b/zebra-crosslink/zebra-rpc/src/methods.rs
+@@ -97,7 +97,7 @@ use zebra_state::{
+     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
+     State as StateService, TransactionLocation,
+ };
+-use zebra_state::crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse};
++use zebra_state::crosslink::{TFLBftBlockInfo, TFLBftInternalStats, TFLBlockFinality, TFLFinalityStatus, TFLQuorumMember, TFLRoundDiagnosis, TFLServiceRequest, TFLServiceResponse, WalletSyncStatusSnapshot};
+ 
+ use crate::{
+     client::TransactionTemplate,
+@@ -634,6 +634,131 @@ pub trait Rpc {
+     #[method(name = "wallet_spendable_funds")]
+     async fn wallet_spendable_funds(&self) -> Result<serde_json::Value>;
+ 
++    /// Summarise BFT finality health: is finality working, and if not, why not?
++    ///
++    /// One call covering this node's BFT position (height/round/step, time since the last
++    /// decision), how finality relates to the PoW chain (tip, finalized height, gap), and
++    /// whether enough voting power is online to decide a block at all. `healthy` is true
++    /// when nothing was flagged; otherwise `diagnosis` explains what is wrong in plain
++    /// terms. Start here, then use `get_tfl_quorum_status` or `get_tfl_round_diagnosis`
++    /// for detail.
++    ///
++    /// Finalizer keys here and in the other diagnostic methods are hex in display order,
++    /// matching the node's log lines and `get_tfl_recency_status` -- note this is the
++    /// opposite orientation to `get_tfl_roster_zats`, which is why these methods do the
++    /// roster join for you.
++    ///
++    /// zcashd reference: none
++    /// method: post
++    /// tags: tfl
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_tfl_finality_status", "params": [], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_tfl_finality_status")]
++    async fn get_tfl_finality_status(&self) -> Result<TFLFinalityStatus>;
++
++    /// List each active finalizer with its voting power, liveness and votes at this node's
++    /// current BFT height, already joined together.
++    ///
++    /// Use it to answer "who is holding up finality?" -- the offline rows, and their
++    /// combined power, are what stands between the chain and a quorum.
++    ///
++    /// zcashd reference: none
++    /// method: post
++    /// tags: tfl
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_tfl_quorum_status", "params": [], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_tfl_quorum_status")]
++    async fn get_tfl_quorum_status(&self) -> Result<Vec<TFLQuorumMember>>;
++
++    /// Explain why each round at the current BFT height has not decided.
++    ///
++    /// The structured form of the node's `DECIDE_WAIT` log line. It separates the two
++    /// failure modes that look identical from outside: a round short of precommit power
++    /// (`precommit_power_short_by` above zero, `silent` naming who has not voted) from one
++    /// whose proposal cannot be validated (`proposal_blocked_on_block` naming the PoW block
++    /// this node is missing).
++    ///
++    /// zcashd reference: none
++    /// method: post
++    /// tags: tfl
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_tfl_round_diagnosis", "params": [], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_tfl_round_diagnosis")]
++    async fn get_tfl_round_diagnosis(&self) -> Result<Vec<TFLRoundDiagnosis>>;
++
++    /// Report the sizes of the BFT layer's in-memory structures.
++    ///
++    /// Sample alongside the process's RSS to tell BFT-side accumulation apart from growth
++    /// elsewhere in the node: `recent_commit_round_cache_len` currently retains every
++    /// completed height, so it rises for as long as the process runs.
++    ///
++    /// zcashd reference: none
++    /// method: post
++    /// tags: tfl
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_tfl_bft_internal_stats", "params": [], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_tfl_bft_internal_stats")]
++    async fn get_tfl_bft_internal_stats(&self) -> Result<TFLBftInternalStats>;
++
++    /// Inspect one decided BFT block, by 0-based BFT height (omit for the chain tip).
++    ///
++    /// `candidate_hash` is the PoW block this BFT block finalizes, in display order, so it
++    /// can be handed straight to `getblock` -- which is how you check what a given BFT
++    /// height actually finalized. Returns null for a height this node does not hold.
++    ///
++    /// # Parameters
++    ///
++    /// - `height`: (numeric, optional) 0-based BFT height; defaults to the BFT chain tip.
++    ///
++    /// zcashd reference: none
++    /// method: post
++    /// tags: tfl
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_tfl_bft_block", "params": [109411], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_tfl_bft_block")]
++    async fn get_tfl_bft_block(&self, height: Option<u64>) -> Result<Option<TFLBftBlockInfo>>;
++
++    /// Get the headless wallet's own note-scan progress and balances.
++    ///
++    /// `sync_height` is how far the wallet's note-scan has reached, distinct from the node's
++    /// chain-sync height (see `getblockchaininfo`), which can be fully caught up while this
++    /// still lags, particularly right after a restart. Balances are only accurate once
++    /// `sync_height` is close to `tip_height`.
++    ///
++    /// ## Example Usage
++    /// ```bash
++    /// curl -X POST -H "Content-Type: application/json" -d \
++    /// '{ "jsonrpc": "2.0", "method": "get_wallet_sync_status", "params": [], "id": 1 }' \
++    /// http://127.0.0.1:8232
++    /// ```
++    #[method(name = "get_wallet_sync_status")]
++    async fn get_wallet_sync_status(&self) -> Result<WalletSyncStatusSnapshot>;
++
+     /// Send `value_zats` zatoshis from the wallet to a unified address, returning the txid.
+     ///
+     /// Unlike the GUI's send buttons the value is not quantized; it is an exact zatoshi amount.
+@@ -1166,6 +1291,38 @@ pub trait Rpc {
+     ) -> Result<GetTxOutResponse>;
+ }
+ 
++/// Send one request to the TFL service, mapping a transport failure to a JSON-RPC error.
++///
++/// The `get_tfl_*` diagnostic methods are read-only and independent of each other, so they
++/// dispatch through `oneshot` rather than holding the service ready across calls.
++async fn tfl_request<TFLService>(
++    tfl_service: TFLService,
++    request: TFLServiceRequest,
++) -> Result<TFLServiceResponse>
++where
++    TFLService: Service<
++            TFLServiceRequest,
++            Response = TFLServiceResponse,
++            Error = zebra_node_services::BoxError,
++        > + Clone
++        + Send
++        + Sync
++        + 'static,
++    TFLService::Future: Send,
++{
++    tfl_service.oneshot(request).await.map_misc_error()
++}
++
++/// The TFL service answered a request with the response to a different one. Requests and
++/// responses are paired one to one, so this cannot happen unless the two enums drift apart.
++fn unexpected_tfl_response(method: &str) -> ErrorObject<'static> {
++    ErrorObject::owned(
++        server::error::LegacyCode::Misc.into(),
++        format!("{method}: unexpected response type from the TFL service"),
++        None::<()>,
++    )
++}
++
+ /// RPC method implementations.
+ #[derive(Clone)]
+ pub struct RpcImpl<
+@@ -2458,6 +2615,56 @@ where
+         }
+     }
+ 
++    async fn get_tfl_finality_status(&self) -> Result<TFLFinalityStatus> {
++        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::FinalityStatus).await? {
++            TFLServiceResponse::FinalityStatus(status) => Ok(status),
++            _ => Err(unexpected_tfl_response("get_tfl_finality_status")),
++        }
++    }
++
++    async fn get_tfl_quorum_status(&self) -> Result<Vec<TFLQuorumMember>> {
++        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::QuorumStatus).await? {
++            TFLServiceResponse::QuorumStatus(members) => Ok(members),
++            _ => Err(unexpected_tfl_response("get_tfl_quorum_status")),
++        }
++    }
++
++    async fn get_tfl_round_diagnosis(&self) -> Result<Vec<TFLRoundDiagnosis>> {
++        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::RoundDiagnosis).await? {
++            TFLServiceResponse::RoundDiagnosis(rounds) => Ok(rounds),
++            _ => Err(unexpected_tfl_response("get_tfl_round_diagnosis")),
++        }
++    }
++
++    async fn get_tfl_bft_internal_stats(&self) -> Result<TFLBftInternalStats> {
++        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::BftInternalStats).await? {
++            TFLServiceResponse::BftInternalStats(stats) => Ok(stats),
++            _ => Err(unexpected_tfl_response("get_tfl_bft_internal_stats")),
++        }
++    }
++
++    async fn get_tfl_bft_block(&self, height: Option<u64>) -> Result<Option<TFLBftBlockInfo>> {
++        match tfl_request(self.tfl_service.clone(), TFLServiceRequest::BftBlockInfo(height)).await? {
++            TFLServiceResponse::BftBlockInfo(block) => Ok(block),
++            _ => Err(unexpected_tfl_response("get_tfl_bft_block")),
++        }
++    }
++
++    async fn get_wallet_sync_status(&self) -> Result<WalletSyncStatusSnapshot> {
++        let res = self
++            .tfl_service
++            .clone()
++            .ready()
++            .await
++            .unwrap()
++            .call(TFLServiceRequest::WalletSyncStatus)
++            .await;
++        match res {
++            Ok(TFLServiceResponse::WalletSyncStatus(status)) => Ok(status),
++            _ => Ok(WalletSyncStatusSnapshot::default()),
++        }
++    }
++
+     async fn wallet_spendable_funds(&self) -> Result<serde_json::Value> {
+         let res = self
+             .tfl_service
+diff --git a/zebra-crosslink/zebra-state/src/crosslink.rs b/zebra-crosslink/zebra-state/src/crosslink.rs
+index d135fa0d..e24a1fe1 100644
+--- a/zebra-crosslink/zebra-state/src/crosslink.rs
++++ b/zebra-crosslink/zebra-state/src/crosslink.rs
+@@ -7,6 +7,202 @@ use zebra_chain::block::Height as BlockHeight;
+ pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanBond, ScanInfo, WalletSpendableFunds, WalletStakingPositions};
+ use zcash_primitives::transaction::StakingActionRequest;
+ 
++/// A point-in-time snapshot of the headless wallet's own note-scan progress and balances.
++#[derive(Debug, Default, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
++pub struct WalletSyncStatusSnapshot {
++    /// Highest block height the wallet's own note-scan has processed. Can lag the node's chain
++    /// sync height, particularly right after a restart.
++    pub sync_height: u32,
++    /// The chain tip height the wallet is scanning towards.
++    pub tip_height: u32,
++    /// Confirmed, spendable shielded balance, in zatoshis.
++    pub user_shielded_spendable_zats: u64,
++    /// Unconfirmed/pending shielded balance, in zatoshis.
++    pub user_shielded_pending_zats: u64,
++    /// Transparent balance, in zatoshis.
++    pub user_unshielded_zats: u64,
++    /// Total currently staked (bonded) balance, in zatoshis.
++    pub staked_zats: u64,
++    /// Balance available to withdraw from completed unbonding, in zatoshis.
++    pub withdrawable_zats: u64,
++}
++
++/// How this node's BFT (finality) layer is doing, in one call.
++///
++/// Answers the operator question "is finality working, and if not, why not?" without
++/// scraping the node log. Everything here is read from the live tenderlink state
++/// snapshot the BFT loop publishes each tick, plus the node's own PoW tip, so it is
++/// current to within one BFT tick.
++///
++/// ## Public keys
++/// Finalizer keys in this and the other `get_tfl_*` diagnostic responses are hex in
++/// **display order** -- the same orientation the node's log lines use (`Pub{093e}...`),
++/// and the same as [`TFLRecencyStatus`]. Note that `get_tfl_roster_zats` reports the
++/// *opposite* (raw) orientation for the same keys; these endpoints do the roster join
++/// server-side precisely so that nobody has to reconcile the two by hand.
++#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
++pub struct TFLFinalityStatus {
++    /// Reference time for every other absolute timestamp in this response.
++    pub now_utc: i64,
++
++    /// BFT height this node is currently trying to decide (the height *not yet* decided).
++    pub bft_height: u64,
++    /// Round within `bft_height`. A round above 0 means earlier rounds failed to decide.
++    pub bft_round: u32,
++    /// `"propose"`, `"prevote"` or `"precommit"`.
++    pub bft_step: String,
++    /// Round this node is locked on, or -1.
++    pub bft_locked_round: i64,
++    /// Round of this node's latest valid value, or -1.
++    pub bft_valid_round: i64,
++    /// Number of decided BFT blocks this node holds.
++    pub bft_chain_len: u64,
++    /// When this node last appended a decided BFT block.
++    pub last_decision_utc: Option<i64>,
++    /// Age of the last decision. Climbing without bound is the signature of a stall.
++    pub secs_since_last_decision: Option<i64>,
++
++    /// This node's PoW best-chain tip height.
++    pub pow_tip_height: Option<u32>,
++    /// Highest PoW height covered by BFT finality.
++    pub finalized_height: Option<u32>,
++    /// `pow_tip_height - finalized_height`: how far finality trails the PoW chain.
++    pub finality_gap: Option<u32>,
++
++    /// Active roster size.
++    pub roster_n: usize,
++    /// Total voting power in the active roster.
++    pub total_power: u64,
++    /// Voting power seen directly within the liveness window.
++    pub online_power: u64,
++    /// `online_power` as a percentage of `total_power`.
++    pub online_power_pct: f64,
++    /// Power needed to decide: `2f+1`, computed with the same `f` consensus uses.
++    pub quorum_threshold: u64,
++    /// Whether the power currently seen online could reach `quorum_threshold` at all.
++    pub quorum_online: bool,
++
++    /// True when nothing below flagged a problem.
++    pub healthy: bool,
++    /// Human-readable findings, most important first. Empty when `healthy`.
++    pub diagnosis: Vec<String>,
++}
++
++/// One active-roster finalizer, with its liveness and its votes at this node's current
++/// BFT height already joined together. See [`TFLFinalityStatus`] on key orientation.
++#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
++pub struct TFLQuorumMember {
++    /// Finalizer public key, display order.
++    pub pub_key: zcash_primitives::bft::PubKeyID,
++    /// This finalizer's stake-weighted voting power.
++    pub voting_power: u64,
++    /// `voting_power` as a percentage of the active roster's total.
++    pub power_pct: f64,
++    /// Whether this is us.
++    pub is_me: bool,
++    /// Whether we have heard from this finalizer inside the liveness window.
++    pub online: bool,
++    /// When we last had a direct connection to this finalizer.
++    pub last_seen_utc: Option<i64>,
++    /// Age of `last_seen_utc`.
++    pub secs_since_seen: Option<i64>,
++    /// Whether it has prevoted for a value at our current height.
++    pub prevoted: bool,
++    /// Whether it has precommitted for a value at our current height.
++    pub precommitted: bool,
++    /// Highest round we have seen it vote in at our current height.
++    pub highest_round_vote: u32,
++}
++
++/// Why one round at the current BFT height has not decided.
++///
++/// This is the structured form of the node's `DECIDE_WAIT` log line: it distinguishes a
++/// round short of precommit power (finalizers missing) from one whose proposal cannot be
++/// validated (typically this node not yet holding the candidate PoW block).
++#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
++pub struct TFLRoundDiagnosis {
++    /// BFT height of this round.
++    pub height: u64,
++    /// Round index.
++    pub round: u32,
++
++    /// Whether a proposal has been received for this round.
++    pub proposal_present: bool,
++    /// Proposal chunk signatures received, of those expected.
++    pub proposal_sigs_have: usize,
++    /// Proposal chunk signatures expected.
++    pub proposal_sigs_want: usize,
++    /// `"Pass"`, `"Fail"` or `"Indeterminate"`.
++    pub proposal_validity: String,
++    /// Set when validity is blocked on a PoW block this node does not hold: the hash it
++    /// is waiting for, display order. This is the RPC-visible form of the
++    /// "Didn't have hash available for confirmation" log warning.
++    pub proposal_blocked_on_block: Option<String>,
++    /// Whether the proposal was rejected as faulty.
++    pub proposal_is_faulty: bool,
++
++    /// Total active-roster power for this round.
++    pub total_power: u64,
++    /// The consensus `f` for this round's power.
++    pub f: u64,
++    /// Power needed to decide: `2f+1`.
++    pub quorum_threshold: u64,
++    /// Power that has prevoted for the value.
++    pub yes_prevote_power: u64,
++    /// Power that has precommitted for the value.
++    pub yes_precommit_power: u64,
++    /// Additional precommit power still needed to reach `quorum_threshold`.
++    pub precommit_power_short_by: u64,
++
++    /// One character per active roster index, same encoding as the `DECIDE_WAIT` log
++    /// line: `C` yes-precommit, `n` nil-precommit, `p` prevote only, `.` silent.
++    pub votes: String,
++    /// Finalizers that have not voted at all in this round -- who to chase.
++    pub silent: Vec<zcash_primitives::bft::PubKeyID>,
++}
++
++/// Sizes of the BFT layer's in-memory structures.
++///
++/// `rounds_data` and `recent_commit_round_cache` are the two that grow with uptime;
++/// `recent_commit_round_cache` in particular currently retains every completed height.
++/// Sampling these alongside RSS is what separates "the BFT layer is accumulating state"
++/// from "something else on the node is".
++#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
++pub struct TFLBftInternalStats {
++    /// Rounds held for the height(s) in progress.
++    pub rounds_data_len: usize,
++    /// Completed-height rounds retained in the commit cache.
++    pub recent_commit_round_cache_len: usize,
++    /// Decided BFT blocks held in memory.
++    pub bft_blocks_len: usize,
++    /// Entries in the BFT block-hash index.
++    pub bft_block_index_len: usize,
++    /// BFT peer connection lines, as the node reports them.
++    pub peers: Vec<String>,
++}
++
++/// A decided BFT block, as this node holds it.
++#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
++pub struct TFLBftBlockInfo {
++    /// 0-based BFT chain height.
++    pub height: u64,
++    /// Block hash, display order.
++    pub hash: String,
++    /// Block version.
++    pub version: u32,
++    /// PoW headers carried by this block.
++    pub header_count: usize,
++    /// Hash of the finalization candidate -- the PoW block this BFT block finalizes to.
++    /// Display order, so it can be passed straight to `getblock`.
++    pub candidate_hash: Option<String>,
++    /// PoW height before which this BFT block must not be included.
++    pub do_not_include_until_bc_height: u64,
++    /// Finalizer signatures on this block.
++    pub signature_count: usize,
++    /// Hardfork rules activated by this block.
++    pub hardfork_count: usize,
++}
++
+ /// The finality status of a block
+ #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+ pub enum TFLBlockFinality {
+@@ -43,6 +239,18 @@ pub enum TFLServiceRequest {
+     WalletStakingPositions,
+     /// Query what the wallet can spend now, and its own address
+     WalletSpendableFunds,
++    /// Query the wallet's note-scan progress and balances
++    WalletSyncStatus,
++    /// Summary of BFT finality health
++    FinalityStatus,
++    /// Per-finalizer liveness and votes at the current BFT height
++    QuorumStatus,
++    /// Why the rounds at the current BFT height have not decided
++    RoundDiagnosis,
++    /// Sizes of the BFT layer's in-memory structures
++    BftInternalStats,
++    /// A decided BFT block by 0-based height (`None` => chain tip)
++    BftBlockInfo(Option<u64>),
+     /// Send a basic shielded value transfer from the wallet: (value in zatoshis, unified address)
+     WalletBasicSend(u64, String),
+ }
+@@ -66,6 +274,18 @@ pub enum TFLServiceResponse {
+     WalletStakingPositions(WalletStakingPositions),
+     /// Query what the wallet can spend now; `None` until the wallet's first sync pass completes
+     WalletSpendableFunds(Option<WalletSpendableFunds>),
++    /// The wallet's note-scan progress and balances
++    WalletSyncStatus(WalletSyncStatusSnapshot),
++    /// Summary of BFT finality health
++    FinalityStatus(TFLFinalityStatus),
++    /// Per-finalizer liveness and votes at the current BFT height
++    QuorumStatus(Vec<TFLQuorumMember>),
++    /// Why the rounds at the current BFT height have not decided
++    RoundDiagnosis(Vec<TFLRoundDiagnosis>),
++    /// Sizes of the BFT layer's in-memory structures
++    BftInternalStats(TFLBftInternalStats),
++    /// A decided BFT block by height
++    BftBlockInfo(Option<TFLBftBlockInfo>),
+     /// Send a basic shielded value transfer from the wallet
+     WalletBasicSend(Result<String, String>),
+ }
+diff --git a/zebra-crosslink/zebra-state/src/new_network/bft.rs b/zebra-crosslink/zebra-state/src/new_network/bft.rs
+index 942959a3..d5d10bc5 100644
+--- a/zebra-crosslink/zebra-state/src/new_network/bft.rs
++++ b/zebra-crosslink/zebra-state/src/new_network/bft.rs
+@@ -123,6 +123,29 @@ pub fn bft_recency_status() -> TFLRecencyStatus {
+     RECENCY_STATUS.borrow().clone()
+ }
+ 
++/// Diagnostic snapshots of the BFT layer, refreshed from the live tenderlink state on every BFT
++/// tick and served by the get_tfl_* diagnostic RPCs. Tenderlink's `TMState` is reachable only
++/// from inside the `ClosureToAccessBft` callback, so anything an RPC needs has to be copied out
++/// there.
++#[derive(Debug, Default, Clone)]
++pub struct BftDiagnostics {
++    pub quorum_status: Vec<crate::crosslink::TFLQuorumMember>,
++    pub round_diagnosis: Vec<crate::crosslink::TFLRoundDiagnosis>,
++    pub rounds_data_len: usize,
++    pub commit_cache_len: usize,
++    /// When this node last stored a decided BFT block. `None` until the first decision of this
++    /// process: a restart does not carry it over, since replaying the chain says nothing about
++    /// when those blocks were decided in wall-clock terms.
++    pub last_decision_utc: Option<i64>,
++}
++
++static BFT_DIAGNOSTICS: LazyLock<RwLock<BftDiagnostics>> =
++    LazyLock::new(|| RwLock::new(BftDiagnostics::default()));
++
++pub fn bft_diagnostics() -> BftDiagnostics {
++    BFT_DIAGNOSTICS.read().unwrap().clone()
++}
++
+ /// What tenderlink (and the test harness) ask the sync thread.
+ pub enum BftRequest {
+     Propose {
+@@ -1201,6 +1224,8 @@ impl BftRunner {
+             tracing::error!("could not store BFT decision at height {}: {err}", block.height);
+         }
+ 
++        BFT_DIAGNOSTICS.write().unwrap().last_decision_utc = Some(chrono::Utc::now().timestamp());
++
+         match reply {
+             DecisionReply::Tenderlink(reply) => {
+                 // Vote namespacing: the next height's namespace is the cumulative hardfork hash
+@@ -1534,7 +1559,9 @@ impl BftRunner {
+                 Box::pin(async {})
+             })),
+             tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &TMState, bft_key_address_map: &BftAddressMap| {
+-                RECENCY_STATUS.send_replace(recency_status_from(bft_state, bft_key_address_map));
++                let recency = recency_status_from(bft_state, bft_key_address_map);
++                refresh_bft_diagnostics(bft_state, &recency);
++                RECENCY_STATUS.send_replace(recency);
+                 Box::pin(async {})
+             })),
+             ingest,
+@@ -1596,3 +1623,110 @@ fn recency_status_from(bft_state: &TMState, bft_key_address_map: &BftAddressMap)
+         finalizer_statuses,
+     }
+ }
++
++fn refresh_bft_diagnostics(bft_state: &TMState, recency: &TFLRecencyStatus) {
++    use crate::crosslink::{TFLQuorumMember, TFLRoundDiagnosis};
++
++    // A finalizer counts as online if we have had a direct connection inside this window. Two BFT
++    // ticks is far too tight and a minute is too slow to notice a finalizer dropping.
++    const ONLINE_SECS: i64 = 120;
++    let now_utc = recency.now_utc;
++
++    // Power comes from the roster of the newest round at our current height: that is the roster
++    // consensus is voting under right now, which the quorum arithmetic has to agree with.
++    let roster_now: &[SortedRosterMember] = bft_state
++        .rounds_data
++        .iter()
++        .filter(|r| r.height == bft_state.height)
++        .max_by_key(|r| r.round)
++        .map(|r| r.roster.as_slice())
++        .unwrap_or(&[]);
++    let roster_now = &roster_now[..tenderlink::active_roster_len(roster_now)];
++    let total_power: u64 = roster_now.iter().map(|m| m.stake).sum();
++
++    let quorum_status: Vec<TFLQuorumMember> = roster_now
++        .iter()
++        .map(|m| {
++            let st = recency.finalizer_statuses.iter().find(|(key, _)| *key == m.pub_key).map(|(_, st)| st);
++            let last_seen = st.and_then(|st| st.last_direct_connection_utc);
++            TFLQuorumMember {
++                pub_key: m.pub_key,
++                voting_power: m.stake,
++                power_pct: if total_power == 0 { 0.0 } else { 100.0 * m.stake as f64 / total_power as f64 },
++                is_me: m.pub_key == bft_state.my_pub_key,
++                online: last_seen.is_some_and(|t| now_utc - t < ONLINE_SECS),
++                last_seen_utc: last_seen,
++                secs_since_seen: last_seen.map(|t| now_utc - t),
++                prevoted: st.is_some_and(|st| st.no_yes_votes_in_my_height[0][1] > 0),
++                precommitted: st.is_some_and(|st| st.no_yes_votes_in_my_height[1][1] > 0),
++                highest_round_vote: st.map_or(0, |st| st.highest_round_vote),
++            }
++        })
++        .collect();
++
++    let round_diagnosis: Vec<TFLRoundDiagnosis> = bft_state
++        .rounds_data
++        .iter()
++        .filter(|rd| rd.height == bft_state.height)
++        .map(|rd| {
++            let active_n = tenderlink::active_roster_len(&rd.roster);
++            let round_power: u64 = rd.roster[..active_n].iter().map(|m| m.stake).sum();
++            let f = if round_power == 0 { 0 } else { TMState::f_from_n(round_power) };
++            let threshold = if f == 0 { round_power } else { 2 * f + 1 };
++
++            // Same per-member encoding as the DECIDE_WAIT log line, so a support request quoting
++            // one can be read against the other.
++            let n = active_n.min(rd.msg_val_sigs.len());
++            let mut votes = String::with_capacity(n);
++            let mut silent = Vec::new();
++            for i in 0..n {
++                votes.push(if rd.msg_val_sigs[i][1].1 != TMSig::NIL {
++                    'C'
++                } else if rd.msg_nil_sigs[i][1] != TMSig::NIL {
++                    'n'
++                } else if rd.msg_val_sigs[i][0].1 != TMSig::NIL || rd.msg_nil_sigs[i][0] != TMSig::NIL {
++                    'p'
++                } else {
++                    silent.push(rd.roster[i].pub_key);
++                    '.'
++                });
++            }
++
++            let (status, reason) = rd.proposal_checked_validity;
++            TFLRoundDiagnosis {
++                height: rd.height,
++                round: rd.round,
++                proposal_present: !rd.proposal.0.is_empty(),
++                proposal_sigs_have: rd.proposal_sigs_n,
++                proposal_sigs_want: rd.proposal_sigs.len(),
++                proposal_validity: format!("{:?}", status),
++                proposal_blocked_on_block: match reason {
++                    // NeedsBlock carries the hash in internal byte order; render it the way the
++                    // node logs and getblock expect.
++                    TMStatusReason::NeedsBlock { hash } => Some(Hash(hash).to_string()),
++                    TMStatusReason::None => None,
++                },
++                proposal_is_faulty: rd.proposal_is_faulty,
++                total_power: round_power,
++                f,
++                quorum_threshold: threshold,
++                yes_prevote_power: rd.counts.yes_prevotes,
++                yes_precommit_power: rd.counts.yes_precommits,
++                precommit_power_short_by: threshold.saturating_sub(rd.counts.yes_precommits),
++                votes,
++                silent,
++            }
++        })
++        .collect();
++
++    let mut diag = BFT_DIAGNOSTICS.write().unwrap();
++    // Between a decision and the next round starting there is briefly no round at the current
++    // height, hence no roster to read power from. Keep the last real snapshot rather than
++    // publishing an empty one, or the health check flaps to "no active roster" at every decision.
++    if !quorum_status.is_empty() {
++        diag.quorum_status = quorum_status;
++    }
++    diag.round_diagnosis = round_diagnosis;
++    diag.rounds_data_len = bft_state.rounds_data.len();
++    diag.commit_cache_len = bft_state.recent_commit_round_cache.len();
++}
+diff --git a/wallet/src/lib.rs b/wallet/src/lib.rs
+index 8030b100..bcef212c 100644
+--- a/wallet/src/lib.rs
++++ b/wallet/src/lib.rs
+@@ -121,6 +123,29 @@ pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None
+ pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
+ pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
+ 
++/// Point-in-time snapshot of the headless wallet's own note-scan progress and balances,
++/// refreshed beside the `WalletState` update in `wallet_main`. Mirrors
++/// `zebra_state::crosslink::WalletSyncStatusSnapshot`, which this crate cannot depend on.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct WalletSyncStatus {
++    pub sync_height: u32,
++    pub tip_height: u32,
++    pub user_shielded_spendable_zats: u64,
++    pub user_shielded_pending_zats: u64,
++    pub user_unshielded_zats: u64,
++    pub staked_zats: u64,
++    pub withdrawable_zats: u64,
++}
++pub static WALLET_SYNC_STATUS: Mutex<WalletSyncStatus> = Mutex::new(WalletSyncStatus {
++    sync_height: 0,
++    tip_height: 0,
++    user_shielded_spendable_zats: 0,
++    user_shielded_pending_zats: 0,
++    user_unshielded_zats: 0,
++    staked_zats: 0,
++    withdrawable_zats: 0,
++});
++
+ pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+ 
+ /// Staged basic send requested over RPC: (value in zatoshis, unified address string, result channel).
+@@ -4859,6 +5797,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
+ 
+             lock.staked_balance = user_staked_funds;
+             lock.withdrawable_balance = user_withdrawable_funds;
++
++            *WALLET_SYNC_STATUS.lock().unwrap() = WalletSyncStatus {
++                sync_height: wallets_sync_h.0,
++                tip_height: network_tip_h.0,
++                user_shielded_spendable_zats: user_shielded_spendable_funds,
++                user_shielded_pending_zats: user_shielded_pending_funds,
++                user_unshielded_zats: user_unshielded_funds,
++                staked_zats: user_staked_funds,
++                withdrawable_zats: user_withdrawable_funds,
++            };
+         }
+ 
+ 

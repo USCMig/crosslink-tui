@@ -4,7 +4,7 @@
 use crate::node;
 use crate::rpc::Rpc;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +37,10 @@ pub struct Snap {
     pub finalizer_address: Option<String>,
     pub solvers: Option<String>,
     pub positions: Value,
+    /// RPCs this node build answered with "Method not found".
+    pub missing_rpcs: BTreeSet<String>,
+    /// Balances came from `wallet_spendable_funds` because `get_wallet_sync_status` is missing.
+    pub wallet_fallback: bool,
     pub updated: Option<chrono::DateTime<chrono::Local>>,
 }
 
@@ -80,6 +84,10 @@ impl Poller {
             let pid = s.service.get("MainPID").cloned().unwrap_or_default();
             let missing = s.finalizer_address.is_none() || s.solvers.is_none();
             let due = pid != last_pid || (missing && last_lookup.is_none_or(|t| t.elapsed() > Duration::from_secs(60)));
+            if pid != last_pid {
+                // A restart may be a different build, so probe every RPC again.
+                s.missing_rpcs.clear();
+            }
             if due && !lookup_busy.swap(true, Ordering::Relaxed) {
                 last_pid = pid;
                 last_lookup = Some(Instant::now());
@@ -123,23 +131,73 @@ impl Poller {
                 return;
             }
         }
-        let get = |m: &str, p: Value| self.rpc.call(m, p).unwrap_or(Value::Null);
-        s.chain = get("getblockchaininfo", json!([]));
-        s.header = match s.chain.get("bestblockhash").and_then(Value::as_str) {
-            Some(h) => get("getblockheader", json!([h, true])),
+        s.chain = self.get(s, "getblockchaininfo", json!([]));
+        s.header = match s.chain.get("bestblockhash").and_then(Value::as_str).map(String::from) {
+            Some(h) => self.get(s, "getblockheader", json!([h, true])),
             None => Value::Null,
         };
-        s.mining = get("getmininginfo", json!([]));
-        s.mempool = get("getmempoolinfo", json!([]));
-        s.peers = get("getpeerinfo", json!([]));
-        s.wallet = get("get_wallet_sync_status", json!([]));
-        s.roster = get("get_tfl_roster_zats", json!([]));
-        s.positions = get("wallet_staking_positions", json!([]));
-        s.final_tip = get("get_tfl_final_block_height_and_hash", json!([]));
-        s.finality = get("get_tfl_finality_status", json!([]));
-        s.quorum = get("get_tfl_quorum_status", json!([]));
-        s.rounds = get("get_tfl_round_diagnosis", json!([]));
-        s.bft_stats = get("get_tfl_bft_internal_stats", json!([]));
-        s.bft_block = get("get_tfl_bft_block", json!([]));
+        s.mining = self.get(s, "getmininginfo", json!([]));
+        s.mempool = self.get(s, "getmempoolinfo", json!([]));
+        s.peers = self.get(s, "getpeerinfo", json!([]));
+        s.roster = self.get(s, "get_tfl_roster_zats", json!([]));
+        s.positions = self.get(s, "wallet_staking_positions", json!([]));
+        s.wallet = self.get(s, "get_wallet_sync_status", json!([]));
+        s.wallet_fallback = s.missing_rpcs.contains("get_wallet_sync_status");
+        if s.wallet_fallback {
+            s.wallet = self.wallet_from_vanilla_rpcs(s);
+        }
+        s.final_tip = self.get(s, "get_tfl_final_block_height_and_hash", json!([]));
+        s.finality = self.get(s, "get_tfl_finality_status", json!([]));
+        s.quorum = self.get(s, "get_tfl_quorum_status", json!([]));
+        s.rounds = self.get(s, "get_tfl_round_diagnosis", json!([]));
+        s.bft_stats = self.get(s, "get_tfl_bft_internal_stats", json!([]));
+        s.bft_block = self.get(s, "get_tfl_bft_block", json!([]));
+    }
+
+    /// Calls `method`, remembering it if this node build does not have it.
+    fn get(&self, s: &mut Snap, method: &str, params: Value) -> Value {
+        if s.missing_rpcs.contains(method) {
+            return Value::Null;
+        }
+        match self.rpc.call(method, params) {
+            Ok(v) => v,
+            Err(e) => {
+                if e.contains("Method not found") {
+                    s.missing_rpcs.insert(method.to_string());
+                }
+                Value::Null
+            }
+        }
+    }
+
+    /// The `get_wallet_sync_status` fields that vanilla RPCs can supply: balances from
+    /// `wallet_spendable_funds`, staked and withdrawable totals from `wallet_staking_positions`.
+    /// There is no vanilla equivalent of the wallet's scan height.
+    fn wallet_from_vanilla_rpcs(&self, s: &mut Snap) -> Value {
+        let funds = self.get(s, "wallet_spendable_funds", json!([]));
+        if funds.is_null() {
+            return Value::Null;
+        }
+        let total = |list: Option<&Value>| -> u64 {
+            list.and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b.get("latest_val").and_then(Value::as_u64))
+                .sum()
+        };
+        let staked: u64 = s
+            .positions
+            .get("active")
+            .and_then(Value::as_object)
+            .map(|m| m.values().map(|v| total(Some(v))).sum())
+            .unwrap_or(0);
+        json!({
+            "tip_height": funds.get("tip_height"),
+            "user_shielded_spendable_zats": funds.get("spendable_zats"),
+            "user_shielded_pending_zats": funds.get("pending_zats"),
+            "user_unshielded_zats": funds.get("unshielded_zats"),
+            "staked_zats": staked,
+            "withdrawable_zats": total(s.positions.get("withdrawable")),
+        })
     }
 }
