@@ -2,6 +2,7 @@
 name = "crosslink-tui"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Terminal UI for running a Crosslink (zebrad) node, modelled on grin's node TUI"
 repository = "https://github.com/USCMig/crosslink-tui"
 

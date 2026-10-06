@@ -69,3 +69,7 @@ Options:
   (10368-block period, 3456-block window, first window at height 20736).
 - **Finalizer address:** this node's finalizer address is read from the startup line zebrad writes
   to the journal.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
