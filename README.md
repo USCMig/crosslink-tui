@@ -166,6 +166,9 @@ patch updated.
   (10368-block period, 3456-block window, first window at height 20736).
 - **Finalizer address:** this node's finalizer address is read from the startup line zebrad writes
   to its log.
+- **One outbound request:** the Top Stakers page fetches the public roster document at
+  `https://ctaz.cash/v14/api/roster` about every 45 seconds. It is a plain GET that sends no node or
+  wallet data, but that site sees your IP address. Every other panel talks only to your own node.
 
 ## Releases
 
