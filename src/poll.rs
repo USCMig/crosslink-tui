@@ -121,7 +121,15 @@ impl Poller {
             if let Some(result) = board_slot.lock().unwrap().take() {
                 match result {
                     Ok(v) => {
-                        s.board = v;
+                        // ctaz.cash answers chain_changed_retrying with finalizers: null.
+                        // That is not an empty board. Keep the last list and try again soon.
+                        if !board_has_finalizers(&v) {
+                            let wait = BOARD_EVERY.saturating_sub(Duration::from_secs(8));
+                            last_board = Instant::now().checked_sub(wait);
+                        }
+                        if board_has_finalizers(&v) || !board_has_finalizers(&s.board) {
+                            s.board = v;
+                        }
                         s.board_error = None;
                     }
                     Err(e) => s.board_error = Some(e),
@@ -236,5 +244,29 @@ impl Poller {
             "staked_zats": staked,
             "withdrawable_zats": total(s.positions.get("withdrawable")),
         })
+    }
+}
+
+/// True when the public roster document actually lists bonded finalizers.
+fn board_has_finalizers(doc: &Value) -> bool {
+    doc.get("staking")
+        .and_then(|s| s.get("finalizers"))
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn null_finalizers_are_not_a_board() {
+        let retrying = json!({
+            "staking": {"ok": false, "status": "chain_changed_retrying", "finalizers": null}
+        });
+        let good = json!({"staking": {"finalizers": [{"public_key": "aa"}]}});
+        assert!(!board_has_finalizers(&retrying));
+        assert!(board_has_finalizers(&good));
     }
 }

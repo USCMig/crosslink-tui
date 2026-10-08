@@ -363,7 +363,14 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
     let leader = rows.first().map(|r| r.amount).unwrap_or(0);
 
     if rows.is_empty() {
-        out.append_plain("No bonds.\n");
+        // A retrying index sends finalizers: null. An observed empty array is the real zero.
+        let listed = staking.get("finalizers").and_then(Value::as_array).is_some();
+        let failed = staking.get("ok").and_then(Value::as_bool) == Some(false);
+        if listed && !failed {
+            out.append_plain("No bonds.\n");
+        } else {
+            out.append_plain("Index updating.\n");
+        }
         append_board_error(&mut out, snap, warn);
         return out;
     }
@@ -800,5 +807,16 @@ mod tests {
         assert!(!text.contains("does not stake"), "{text}");
         assert!(!text.contains("Refreshes"), "{text}");
         assert!(!text.contains("Staking window"), "{text}");
+    }
+
+    #[test]
+    fn retrying_index_is_not_an_empty_board() {
+        let mut snap = Snap::default();
+        snap.board = json!({
+            "staking": {"ok": false, "status": "chain_changed_retrying", "finalizers": null}
+        });
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("Index updating"), "{text}");
+        assert!(!text.contains("No bonds"), "{text}");
     }
 }
