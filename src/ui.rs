@@ -60,11 +60,12 @@ impl App {
     }
 }
 
-const PANELS: [(&str, &str); 9] = [
+const PANELS: [(&str, &str); 10] = [
     ("basic", "Basic Status"),
     ("peers", "Peers and Sync"),
     ("mining", "Mining"),
     ("staking", "Staking"),
+    ("stakers", "Top Stakers"),
     ("bft", "BFT Finality"),
     ("config", "Config"),
     ("control", "Node Control"),
@@ -151,6 +152,7 @@ pub fn build(siv: &mut Cursive, app_state: App) {
         stack.add_fullscreen_layer(Layer::new(control_panel().full_screen()).with_name("control_panel"));
         stack.add_fullscreen_layer(Layer::new(config_panel().full_screen()).with_name("config_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("bft_text").full_screen()).with_name("bft_panel"));
+        stack.add_fullscreen_layer(Layer::new(text_panel("stakers_text").full_screen()).with_name("stakers_panel"));
         stack.add_fullscreen_layer(Layer::new(staking_panel().full_screen()).with_name("staking_panel"));
         stack.add_fullscreen_layer(Layer::new(mining_panel(&cfg).full_screen()).with_name("mining_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("peers_text").full_screen()).with_name("peers_panel"));
@@ -255,6 +257,7 @@ pub fn refresh(s: &mut Cursive) {
             refresh_roster(s, &snap);
             refresh_bonds(s, &snap);
         }
+        "stakers" => set_text(s, "stakers_text", render::top_stakers(&snap)),
         "bft" => set_text(s, "bft_text", render::bft(&snap)),
         "config" => set_text(s, "config_status", config_status(&config_path, dirty)),
         "control" => set_text(s, "control_text", render::node_control(&snap, &service)),

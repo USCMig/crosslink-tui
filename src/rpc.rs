@@ -33,3 +33,20 @@ impl Rpc {
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
     }
 }
+
+/// GET a JSON document. Used for the public bonded-stake board, which is not a node RPC.
+pub fn get_json(url: &str, timeout: Duration) -> Result<Value, String> {
+    match ureq::get(url)
+        .set("User-Agent", "crosslink-tui/0.1")
+        .set("Accept", "application/json")
+        .timeout(timeout)
+        .call()
+    {
+        Ok(r) => r.into_json().map_err(|e| format!("response was not JSON ({e})")),
+        Err(ureq::Error::Status(code, r)) => {
+            let _ = r.into_string();
+            Err(format!("HTTP {code}"))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}

@@ -15,6 +15,7 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 | Peers and Sync | PoW peers (address, direction, agent, last message, ping) and BFT peers |
 | Mining | Edit the internal miner's payout address, threads, enabled and low-priority settings; shows running solvers and any GPU solver configured in systemd |
 | Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw `staking_command` editor |
+| Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. The voting roster stays empty until the snapshot |
 | BFT Finality | `get_tfl_finality_status`, `get_tfl_quorum_status`, `get_tfl_round_diagnosis`, `get_tfl_bft_internal_stats`, `get_tfl_bft_block` |
 | Config | Every value in `zebrad.toml`: edit, add, remove, save, reload, or open in `$EDITOR` |
 | Node Control | Service state; start, stop and restart with `sudo systemctl`, or a quick restart without sudo (Linux with systemd) |
@@ -29,7 +30,7 @@ confirmation, with Cancel selected by default.
 
 | | Linux (systemd) | macOS, Windows, Linux without systemd |
 |---|---|---|
-| Status, peers, mining, staking, BFT, config panels | yes | yes |
+| Status, peers, mining, staking, top stakers, BFT, config panels | yes | yes |
 | Logs and finalizer address | from the unit's journal, or `--log-file` | from `--log-file` |
 | Start, stop, restart | yes | no: start and stop zebrad yourself |
 
