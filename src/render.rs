@@ -1,6 +1,8 @@
 //! Snapshot -> panel text. Pure functions, so every panel renders the same way from the same data.
 
 use crate::poll::Snap;
+use cursive::theme::{BaseColor, Color, ColorStyle};
+use cursive::utils::markup::StyledString;
 use serde_json::Value;
 use std::fmt::Write;
 
@@ -10,14 +12,15 @@ pub const FIRST_WINDOW: u64 = 2 * STAKING_PERIOD;
 const RULE: &str = "--------------------------------------------------------------";
 const W: usize = 30;
 
+fn ctaz_num(z: u64) -> String {
+    let s = format!("{}.{:08}", z / 100_000_000, z % 100_000_000);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 pub fn zats(v: Option<u64>) -> String {
     match v {
         None => "-".into(),
-        Some(z) => {
-            let s = format!("{}.{:08}", z / 100_000_000, z % 100_000_000);
-            let s = s.trim_end_matches('0').trim_end_matches('.');
-            format!("{s} cTAZ")
-        }
+        Some(z) => format!("{} cTAZ", ctaz_num(z)),
     }
 }
 
@@ -293,6 +296,250 @@ pub fn roster_rows(snap: &Snap) -> Vec<RosterRow> {
         .collect()
 }
 
+/// How many bonded finalizers the snapshot keeps as the voting set.
+const COMMITTEE_N: usize = 12;
+const BAR_W: usize = 24;
+const POOL_W: usize = 40;
+
+struct Seat {
+    pk: String,
+    label: Option<String>,
+    amount: u64,
+    bonds: u64,
+    me: bool,
+}
+
+/// Bonded-stake leaderboard from the public cTAZ roster document.
+///
+/// The node's `get_tfl_roster_zats` stays empty until the snapshot, so this page reads
+/// `staking.finalizers` instead. Finalizer addresses are matched to mark our row and never drawn.
+pub fn top_stakers(snap: &Snap) -> StyledString {
+    let mut out = StyledString::new();
+    let plain = ColorStyle::primary();
+    let dim = fg(Color::Light(BaseColor::Black));
+    let warn = ColorStyle::title_secondary();
+    let green = fg(Color::Light(BaseColor::Green));
+    let yellow = fg(Color::Light(BaseColor::Yellow));
+    let cyan = fg(Color::Light(BaseColor::Cyan));
+    let magenta = fg(Color::Light(BaseColor::Magenta));
+
+    if snap.board.is_null() {
+        match &snap.board_error {
+            Some(e) => out.append_styled(format!("Board unavailable: {}.\n", brief(e)), warn),
+            None => out.append_plain("Fetching...\n"),
+        }
+        return out;
+    }
+
+    let doc = &snap.board;
+    let staking = doc.get("staking").cloned().unwrap_or(Value::Null);
+
+    let mut labels = std::collections::HashMap::<String, String>::new();
+    for id in doc.get("published_identities").and_then(Value::as_array).into_iter().flatten() {
+        let Some(pk) = id.get("public_key").and_then(Value::as_str) else { continue };
+        let Some(label) = id.get("label").and_then(Value::as_str).filter(|s| !s.is_empty()) else { continue };
+        labels.insert(pk.to_ascii_lowercase(), label.to_string());
+    }
+
+    let mine = snap.finalizer_address.as_deref();
+    let mut rows = Vec::new();
+    for f in staking.get("finalizers").and_then(Value::as_array).into_iter().flatten() {
+        let Some(pk) = f.get("public_key").and_then(Value::as_str) else { continue };
+        let addr = f.get("finalizer_address").and_then(Value::as_str);
+        rows.push(Seat {
+            label: labels.get(&pk.to_ascii_lowercase()).cloned(),
+            pk: pk.to_ascii_lowercase(),
+            amount: json_u64(f.get("active_amount_zats")).unwrap_or(0),
+            bonds: json_u64(f.get("active_bond_count")).unwrap_or(0),
+            me: match (mine, addr) {
+                (Some(m), Some(a)) => a.eq_ignore_ascii_case(m),
+                _ => false,
+            },
+        });
+    }
+    // Same order the snapshot uses: bonded amount, then public key, both descending.
+    rows.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| b.pk.cmp(&a.pk)));
+    let total: u64 = rows.iter().map(|r| r.amount).sum();
+    let leader = rows.first().map(|r| r.amount).unwrap_or(0);
+
+    if rows.is_empty() {
+        // A retrying index sends finalizers: null. An observed empty array is the real zero.
+        let listed = staking.get("finalizers").and_then(Value::as_array).is_some();
+        let failed = staking.get("ok").and_then(Value::as_bool) == Some(false);
+        if listed && !failed {
+            out.append_plain("No bonds.\n");
+        } else {
+            out.append_plain("Index updating.\n");
+        }
+        append_board_error(&mut out, snap, warn);
+        return out;
+    }
+    if staking.get("complete").and_then(Value::as_bool) == Some(false) {
+        out.append_styled("still indexing\n", warn);
+    }
+    if mine.is_none() {
+        out.append_styled("row not marked yet\n", dim);
+    } else if !rows.iter().any(|r| r.me) {
+        out.append_plain("no bond on this board\n");
+    }
+
+    // Stacked bar for the pool, then one bar per finalizer scaled to the leader.
+    let shown = rows.len().min(4);
+    let rest: u64 = rows.iter().skip(shown).map(|r| r.amount).sum();
+    let mut parts: Vec<u64> = rows.iter().take(shown).map(|r| r.amount).collect();
+    if rest > 0 {
+        parts.push(rest);
+    }
+    let widths = alloc_widths(&parts, POOL_W);
+    let palette = [yellow, cyan, plain, magenta];
+    for (i, w) in widths.iter().copied().enumerate() {
+        let (style, ch) = if i < shown && rows[i].me {
+            (green, "█")
+        } else if rest > 0 && i + 1 == widths.len() {
+            (dim, "░")
+        } else {
+            (palette.get(i).copied().unwrap_or(dim), "█")
+        };
+        out.append_styled(ch.repeat(w), style);
+    }
+    out.append_plain("\n");
+    for i in 0..shown {
+        let style = if rows[i].me { green } else { palette[i] };
+        let name = legend_name(&rows[i]);
+        out.append_styled(format!("█ {name} {:.1}%  ", pct(rows[i].amount, total)), style);
+    }
+    if rest > 0 {
+        out.append_styled(format!("░ other {:.1}%", pct(rest, total)), dim);
+    }
+    out.append_plain("\n");
+    out.append_styled(format!("{:>3}  {:<22} {:>14} {:>7} {:>5}\n", "#", "name", "cTAZ", "share", "bonds"), dim);
+
+    for (i, row) in rows.iter().enumerate() {
+        let rank = i + 1;
+        if i == COMMITTEE_N {
+            out.append_styled(format!("── top {COMMITTEE_N} ──\n"), dim);
+        }
+        let in_set = rank <= COMMITTEE_N;
+        let text_style = if row.me { green } else if in_set { plain } else { dim };
+        let bar_style = if row.me {
+            green
+        } else if rank == 1 {
+            yellow
+        } else if in_set {
+            cyan
+        } else {
+            dim
+        };
+        let filled = blocks(row.amount, leader, BAR_W);
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
+        out.append_styled(
+            format!(
+                "{rank:>3}  {} {:>14} {:>6.2}% {:>5}  ",
+                fit(&seat_name(row), 22),
+                ctaz_num(row.amount),
+                pct(row.amount, total),
+                row.bonds
+            ),
+            text_style,
+        );
+        out.append_styled(bar, bar_style);
+        out.append_plain("\n");
+    }
+    append_board_error(&mut out, snap, warn);
+    out
+}
+
+fn append_board_error(out: &mut StyledString, snap: &Snap, style: ColorStyle) {
+    if let Some(e) = &snap.board_error {
+        out.append_styled(format!("Last refresh failed: {}. Showing the previous board.\n", brief(e)), style);
+    }
+}
+
+fn fg(color: Color) -> ColorStyle {
+    ColorStyle::new(color, Color::TerminalDefault)
+}
+
+fn brief(e: &str) -> String {
+    let mut s: String = e.chars().filter(|c| *c != '\n').take(160).collect();
+    if e.chars().filter(|c| *c != '\n').count() > 160 {
+        s.push_str("...");
+    }
+    s
+}
+
+fn json_u64(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn pct(part: u64, total: u64) -> f64 {
+    if total == 0 { 0.0 } else { part as f64 * 100.0 / total as f64 }
+}
+
+fn seat_name(row: &Seat) -> String {
+    match (&row.label, row.me) {
+        (Some(label), true) => format!("* {label}"),
+        (Some(label), false) => label.clone(),
+        (None, true) => "* you".into(),
+        (None, false) => row.pk.chars().take(12).collect(),
+    }
+}
+
+fn legend_name(row: &Seat) -> String {
+    if row.me {
+        "you".into()
+    } else if let Some(label) = &row.label {
+        fit(label, 16).trim_end().to_string()
+    } else {
+        row.pk.chars().take(8).collect()
+    }
+}
+
+fn fit(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        let mut t: String = s.chars().take(width.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
+fn blocks(part: u64, whole: u64, width: usize) -> usize {
+    if whole == 0 || part == 0 || width == 0 {
+        return 0;
+    }
+    ((part as u128 * width as u128) / whole as u128).clamp(1, width as u128) as usize
+}
+
+/// Largest-remainder widths that sum to `width`.
+fn alloc_widths(amounts: &[u64], width: usize) -> Vec<usize> {
+    let total: u128 = amounts.iter().map(|a| *a as u128).sum();
+    if total == 0 || width == 0 {
+        return vec![0; amounts.len()];
+    }
+    let mut widths: Vec<usize> = amounts.iter().map(|a| ((*a as u128 * width as u128) / total) as usize).collect();
+    let mut used: usize = widths.iter().sum();
+    let mut order: Vec<usize> = (0..amounts.len()).collect();
+    order.sort_by(|&i, &j| {
+        let ri = (amounts[i] as u128 * width as u128) % total;
+        let rj = (amounts[j] as u128 * width as u128) % total;
+        rj.cmp(&ri).then(i.cmp(&j))
+    });
+    for i in order {
+        if used >= width {
+            break;
+        }
+        widths[i] += 1;
+        used += 1;
+    }
+    widths
+}
+
 pub fn bft(snap: &Snap) -> String {
     let mut o = String::new();
     let f = &snap.finality;
@@ -506,4 +753,70 @@ pub fn logs(snap: &Snap, filter: usize, hide_noise: bool) -> String {
         o.push_str("No matching log lines yet.\n");
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn top_stakers_marks_you_without_printing_addresses() {
+        let mine = "zfinv1_you_do_not_print";
+        let other = "zfinv1_other_do_not_print";
+        let mut snap = Snap::default();
+        snap.finalizer_address = Some(mine.into());
+        snap.chain = json!({"blocks": 28000});
+        snap.board = json!({
+            "milestones": {"roster_snapshot": 34560, "bft_activation": 36288},
+            "published_identities": [{
+                "public_key": "aa",
+                "label": "zk_nd3r",
+                "address": other
+            }],
+            "staking": {
+                "complete": true,
+                "height": 28000,
+                "indexed_from_height": 20736,
+                "indexed_through_height": 28000,
+                "observed_at": "2026-10-08T02:00:14+00:00",
+                "finalizers": [
+                    {
+                        "public_key": "bb",
+                        "finalizer_address": mine,
+                        "active_amount_zats": "200000000000",
+                        "active_bond_count": 8
+                    },
+                    {
+                        "public_key": "aa",
+                        "finalizer_address": other,
+                        "active_amount_zats": "100000000000",
+                        "active_bond_count": 2
+                    }
+                ]
+            }
+        });
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("* you"), "{text}");
+        assert!(text.contains("zk_nd3r"), "{text}");
+        assert!(text.contains('█'), "{text}");
+        assert!(!text.contains("zfinv1"), "{text}");
+        assert!(!text.contains(mine), "{text}");
+        assert!(!text.contains(other), "{text}");
+        assert!(text.contains("  1  * you"), "{text}");
+        assert!(!text.contains("does not stake"), "{text}");
+        assert!(!text.contains("Refreshes"), "{text}");
+        assert!(!text.contains("Staking window"), "{text}");
+    }
+
+    #[test]
+    fn retrying_index_is_not_an_empty_board() {
+        let mut snap = Snap::default();
+        snap.board = json!({
+            "staking": {"ok": false, "status": "chain_changed_retrying", "finalizers": null}
+        });
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("Index updating"), "{text}");
+        assert!(!text.contains("No bonds"), "{text}");
+    }
 }

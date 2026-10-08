@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 pub const POLL_EVERY: Duration = Duration::from_secs(2);
 const LOG_LINES: usize = 1500;
+/// Public bonded-stake index. The node roster RPC stays empty until the snapshot.
+const ROSTER_URL: &str = "https://ctaz.cash/v14/api/roster";
+const BOARD_EVERY: Duration = Duration::from_secs(45);
 
 #[derive(Default, Clone)]
 pub struct Snap {
@@ -23,6 +26,10 @@ pub struct Snap {
     pub peers: Value,
     pub wallet: Value,
     pub roster: Value,
+    /// `ctaz.cash` roster document. `staking.finalizers` is the bonded-stake board.
+    pub board: Value,
+    /// Set when the latest board fetch failed. The previous `board` is kept.
+    pub board_error: Option<String>,
     pub final_tip: Value,
     pub finality: Value,
     pub quorum: Value,
@@ -64,9 +71,12 @@ impl Poller {
     pub fn run(self, stop: Arc<AtomicBool>, notify: impl Fn() -> bool) {
         let mut last_disk = None::<Instant>;
         let mut last_lookup = None::<Instant>;
+        let mut last_board = None::<Instant>;
         let mut last_pid = String::new();
         let lookup_busy = Arc::new(AtomicBool::new(false));
+        let board_busy = Arc::new(AtomicBool::new(false));
         let found: Arc<Mutex<(Option<String>, Option<String>)>> = Arc::default();
+        let board_slot: Arc<Mutex<Option<Result<Value, String>>>> = Arc::default();
         while !stop.load(Ordering::Relaxed) {
             let mut s = self.snap.lock().unwrap().clone();
             s.service = node::service_props(&self.service);
@@ -104,6 +114,41 @@ impl Poller {
                     s.finalizer_address = addr.clone();
                 }
                 s.solvers = solvers.clone();
+            }
+
+            // The board is a public HTTP document, so fetch it off this loop (a slow TLS
+            // call must not stall the 2s refresh) and even when the node RPC is down.
+            if let Some(result) = board_slot.lock().unwrap().take() {
+                match result {
+                    Ok(v) => {
+                        // ctaz.cash answers chain_changed_retrying with finalizers: null.
+                        // That is not an empty board. Keep the last list and try again soon.
+                        if !board_has_finalizers(&v) {
+                            let wait = BOARD_EVERY.saturating_sub(Duration::from_secs(8));
+                            last_board = Instant::now().checked_sub(wait);
+                        }
+                        if board_has_finalizers(&v) || !board_has_finalizers(&s.board) {
+                            s.board = v;
+                        }
+                        s.board_error = None;
+                    }
+                    Err(e) => s.board_error = Some(e),
+                }
+            }
+            if last_board.is_none_or(|t| t.elapsed() > BOARD_EVERY) && !board_busy.swap(true, Ordering::Relaxed) {
+                last_board = Some(Instant::now());
+                let (slot, busy) = (board_slot.clone(), board_busy.clone());
+                std::thread::spawn(move || {
+                    struct Release(Arc<AtomicBool>);
+                    impl Drop for Release {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    let _release = Release(busy);
+                    let result = crate::rpc::get_json(ROSTER_URL, Duration::from_secs(8));
+                    *slot.lock().unwrap() = Some(result);
+                });
             }
 
             self.fetch_rpc(&mut s);
@@ -199,5 +244,29 @@ impl Poller {
             "staked_zats": staked,
             "withdrawable_zats": total(s.positions.get("withdrawable")),
         })
+    }
+}
+
+/// True when the public roster document actually lists bonded finalizers.
+fn board_has_finalizers(doc: &Value) -> bool {
+    doc.get("staking")
+        .and_then(|s| s.get("finalizers"))
+        .and_then(Value::as_array)
+        .is_some_and(|rows| !rows.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn null_finalizers_are_not_a_board() {
+        let retrying = json!({
+            "staking": {"ok": false, "status": "chain_changed_retrying", "finalizers": null}
+        });
+        let good = json!({"staking": {"finalizers": [{"public_key": "aa"}]}});
+        assert!(!board_has_finalizers(&retrying));
+        assert!(board_has_finalizers(&good));
     }
 }
