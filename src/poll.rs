@@ -30,6 +30,11 @@ pub struct Snap {
     pub board: Value,
     /// Set when the latest board fetch failed. The previous `board` is kept.
     pub board_error: Option<String>,
+    /// When `board` was last replaced by a fetch that listed finalizers.
+    pub board_fetched_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last time the node answered `getinfo`. While `rpc_error` is set, every node-derived field
+    /// still holds the values from this moment.
+    pub rpc_ok_at: Option<chrono::DateTime<chrono::Utc>>,
     pub final_tip: Value,
     pub finality: Value,
     pub quorum: Value,
@@ -127,6 +132,9 @@ impl Poller {
                             let wait = BOARD_EVERY.saturating_sub(Duration::from_secs(8));
                             last_board = Instant::now().checked_sub(wait);
                         }
+                        if board_has_finalizers(&v) {
+                            s.board_fetched_at = Some(chrono::Utc::now());
+                        }
                         if board_has_finalizers(&v) || !board_has_finalizers(&s.board) {
                             s.board = v;
                         }
@@ -170,6 +178,7 @@ impl Poller {
             Ok(v) => {
                 s.info = v;
                 s.rpc_error = None;
+                s.rpc_ok_at = Some(chrono::Utc::now());
             }
             Err(e) => {
                 s.rpc_error = Some(e);

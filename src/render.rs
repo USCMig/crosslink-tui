@@ -296,23 +296,116 @@ pub fn roster_rows(snap: &Snap) -> Vec<RosterRow> {
         .collect()
 }
 
-/// How many bonded finalizers the snapshot keeps as the voting set.
+/// How many bonded finalizers the roster snapshot keeps as the voting set. Only a projection until
+/// the node reports a roster: rank on the bonded-stake board is not a committee seat.
 const COMMITTEE_N: usize = 12;
 const BAR_W: usize = 24;
 const POOL_W: usize = 40;
+/// Freshness limit for the public board when the document does not state `max_age_seconds`.
+const DEFAULT_BOARD_MAX_AGE_SECS: i64 = 75;
 
 struct Seat {
     pk: String,
+    addr: Option<String>,
     label: Option<String>,
     amount: u64,
     bonds: u64,
     me: bool,
 }
 
+/// One voting-roster member as this node reports it (`get_tfl_roster_zats`).
+struct Member {
+    /// Lowercase hex in the RPC's raw byte order.
+    pk: String,
+    addr: Option<String>,
+    power: u64,
+}
+
+fn committee(snap: &Snap) -> Vec<Member> {
+    let mut members: Vec<Member> = snap
+        .roster
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| Member {
+            pk: s(m, "pub_key").to_ascii_lowercase(),
+            addr: m.get("finalizer_address").and_then(Value::as_str).map(String::from),
+            power: u(m, "voting_power").unwrap_or(0),
+        })
+        .collect();
+    members.sort_by(|a, b| b.power.cmp(&a.power).then_with(|| b.pk.cmp(&a.pk)));
+    members
+}
+
+fn reversed_hex(hex: &str) -> String {
+    let bytes: Vec<&str> = (0..hex.len()).step_by(2).filter_map(|i| hex.get(i..i + 2)).collect();
+    bytes.into_iter().rev().collect()
+}
+
+/// The roster rank (1-based) of a board row. The board and the roster RPC may print the public key
+/// in opposite byte orders, so the finalizer address is compared first and the key both ways.
+fn seat_of(seat: &Seat, members: &[Member]) -> Option<usize> {
+    members.iter().position(|m| {
+        matches!((&seat.addr, &m.addr), (Some(a), Some(b)) if a == b) || m.pk == seat.pk || m.pk == reversed_hex(&seat.pk)
+    }).map(|i| i + 1)
+}
+
+fn secs_since(t: chrono::DateTime<chrono::Utc>) -> i64 {
+    (chrono::Utc::now() - t).num_seconds().max(0)
+}
+
+/// How old the board is and whether it is past the index's own freshness limit.
+struct BoardAge {
+    expired: bool,
+    text: String,
+}
+
+fn board_age(snap: &Snap) -> BoardAge {
+    let doc = &snap.board;
+    let st = doc.get("staking").unwrap_or(&Value::Null);
+    let observed = st
+        .get("observed_at")
+        .or_else(|| doc.get("observed_at"))
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or(snap.board_fetched_at);
+    let max_age = st
+        .get("max_age_seconds")
+        .or_else(|| doc.get("max_age_seconds"))
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_BOARD_MAX_AGE_SECS);
+    let height = json_u64(st.get("height")).or_else(|| json_u64(doc.get("height")));
+    let tip = if snap.rpc_error.is_none() { u(&snap.chain, "blocks") } else { None };
+
+    let Some(observed) = observed else {
+        return BoardAge { expired: true, text: "Data age unknown: the index did not say when it observed the chain.".into() };
+    };
+    let secs = secs_since(observed);
+    let block = match (height, tip) {
+        (Some(h), Some(t)) if t > h => format!("block {h} ({} behind your node)", t - h),
+        (Some(h), Some(_)) => format!("block {h} (matches your node)"),
+        (Some(h), None) => format!("block {h}"),
+        (None, _) => "an unknown block".into(),
+    };
+    if secs > max_age {
+        BoardAge {
+            expired: true,
+            text: format!(
+                "EXPIRED: observed {} ago at {block}, past the index's {max_age}s limit. This is the last list the index served and may no longer match the chain.",
+                age(secs)
+            ),
+        }
+    } else {
+        BoardAge { expired: false, text: format!("As of {block}, observed {} ago (valid for {max_age}s).", age(secs)) }
+    }
+}
+
 /// Bonded-stake leaderboard from the public cTAZ roster document.
 ///
-/// The node's `get_tfl_roster_zats` stays empty until the snapshot, so this page reads
-/// `staking.finalizers` instead. Finalizer addresses are matched to mark our row and never drawn.
+/// Rank here is bonded stake only. Committee membership comes from the node's own voting roster
+/// (`get_tfl_roster_zats`), which stays empty until BFT starts; until then the top-`COMMITTEE_N`
+/// line is a projection. Finalizer addresses are matched to mark our row and never drawn.
 pub fn top_stakers(snap: &Snap) -> StyledString {
     let mut out = StyledString::new();
     let plain = ColorStyle::primary();
@@ -322,6 +415,9 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
     let yellow = fg(Color::Light(BaseColor::Yellow));
     let cyan = fg(Color::Light(BaseColor::Cyan));
     let magenta = fg(Color::Light(BaseColor::Magenta));
+
+    out.append_styled("Bonded stake ranking", ColorStyle::title_primary());
+    out.append_styled(" from the public index (ctaz.cash). Rank is by bonded stake; it is not committee membership.\n", dim);
 
     if snap.board.is_null() {
         match &snap.board_error {
@@ -333,6 +429,29 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
 
     let doc = &snap.board;
     let staking = doc.get("staking").cloned().unwrap_or(Value::Null);
+    let freshness = board_age(snap);
+    out.append_styled(format!("{}\n", freshness.text), if freshness.expired { warn } else { dim });
+
+    let members = committee(snap);
+    let known = !members.is_empty();
+    if known {
+        out.append_styled(
+            format!("Committee: {} seats in your node's voting roster. The `seat` column is actual membership.\n", members.len()),
+            dim,
+        );
+    } else {
+        let ms = doc.get("milestones");
+        let at = |k: &str| ms.and_then(|m| json_u64(m.get(k)));
+        let when = match (at("roster_snapshot"), at("bft_activation")) {
+            (Some(r), Some(b)) => format!(" (roster snapshot at block {r}; BFT starts at block {b})"),
+            (None, Some(b)) => format!(" (BFT starts at block {b})"),
+            _ => String::new(),
+        };
+        out.append_styled(
+            format!("Committee: not formed yet. Your node reports no voting roster{when}. The top-{COMMITTEE_N} line below is a projection by bonded stake, not confirmed seats.\n"),
+            warn,
+        );
+    }
 
     let mut labels = std::collections::HashMap::<String, String>::new();
     for id in doc.get("published_identities").and_then(Value::as_array).into_iter().flatten() {
@@ -349,6 +468,7 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
         rows.push(Seat {
             label: labels.get(&pk.to_ascii_lowercase()).cloned(),
             pk: pk.to_ascii_lowercase(),
+            addr: addr.map(String::from),
             amount: json_u64(f.get("active_amount_zats")).unwrap_or(0),
             bonds: json_u64(f.get("active_bond_count")).unwrap_or(0),
             me: match (mine, addr) {
@@ -382,6 +502,10 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
     } else if !rows.iter().any(|r| r.me) {
         out.append_plain("no bond on this board\n");
     }
+    out.append_plain("\n");
+
+    // An expired board is drawn entirely in the dim style, so it cannot pass for live data.
+    let live = |style: ColorStyle| if freshness.expired { dim } else { style };
 
     // Stacked bar for the pool, then one bar per finalizer scaled to the leader.
     let shown = rows.len().min(4);
@@ -400,26 +524,28 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
         } else {
             (palette.get(i).copied().unwrap_or(dim), "█")
         };
-        out.append_styled(ch.repeat(w), style);
+        out.append_styled(ch.repeat(w), live(style));
     }
     out.append_plain("\n");
     for i in 0..shown {
         let style = if rows[i].me { green } else { palette[i] };
         let name = legend_name(&rows[i]);
-        out.append_styled(format!("█ {name} {:.1}%  ", pct(rows[i].amount, total)), style);
+        out.append_styled(format!("█ {name} {:.1}%  ", pct(rows[i].amount, total)), live(style));
     }
     if rest > 0 {
         out.append_styled(format!("░ other {:.1}%", pct(rest, total)), dim);
     }
     out.append_plain("\n");
-    out.append_styled(format!("{:>3}  {:<22} {:>14} {:>7} {:>5}\n", "#", "name", "cTAZ", "share", "bonds"), dim);
+    out.append_styled(format!("{:>3}  {:<22} {:>14} {:>7} {:>5}  {:<8} \n", "#", "name", "cTAZ", "share", "bonds", "seat"), dim);
 
     for (i, row) in rows.iter().enumerate() {
         let rank = i + 1;
         if i == COMMITTEE_N {
-            out.append_styled(format!("── top {COMMITTEE_N} ──\n"), dim);
+            let note = if known { "by bonded stake" } else { "by bonded stake: projected cutoff, not confirmed seats" };
+            out.append_styled(format!("── top {COMMITTEE_N} {note} ──\n"), dim);
         }
-        let in_set = rank <= COMMITTEE_N;
+        let seat = seat_of(row, &members);
+        let in_set = if known { seat.is_some() } else { rank <= COMMITTEE_N };
         let text_style = if row.me { green } else if in_set { plain } else { dim };
         let bar_style = if row.me {
             green
@@ -430,20 +556,49 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
         } else {
             dim
         };
+        let seat_text = match (known, seat) {
+            (false, _) => "-".to_string(),
+            (true, Some(n)) => format!("#{n}"),
+            (true, None) => "none".to_string(),
+        };
         let filled = blocks(row.amount, leader, BAR_W);
         let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
         out.append_styled(
             format!(
-                "{rank:>3}  {} {:>14} {:>6.2}% {:>5}  ",
+                "{rank:>3}  {} {:>14} {:>6.2}% {:>5}  {:<8} ",
                 fit(&seat_name(row), 22),
                 ctaz_num(row.amount),
                 pct(row.amount, total),
-                row.bonds
+                row.bonds,
+                seat_text,
             ),
-            text_style,
+            live(text_style),
         );
-        out.append_styled(bar, bar_style);
+        out.append_styled(bar, live(bar_style));
         out.append_plain("\n");
+    }
+
+    if known {
+        let total_power: u64 = members.iter().map(|m| m.power).sum();
+        out.append_plain("\n");
+        out.append_styled("Committee from your node (get_tfl_roster_zats), by voting power\n", ColorStyle::title_primary());
+        out.append_styled(format!("{:>4}  {:<22} {:>16} {:>7}  {}\n", "seat", "finalizer", "voting power", "share", "bonded rank"), dim);
+        for (i, m) in members.iter().enumerate() {
+            let board_rank = rows.iter().position(|r| seat_of(r, std::slice::from_ref(m)).is_some()).map(|r| r + 1);
+            let name = board_rank
+                .map(|r| seat_name(&rows[r - 1]))
+                .unwrap_or_else(|| m.pk.chars().take(12).collect());
+            let me = matches!((&m.addr, mine), (Some(a), Some(b)) if a == b);
+            let rank_text = match board_rank {
+                Some(r) if r == i + 1 => format!("#{r}"),
+                Some(r) => format!("#{r} (differs)"),
+                None => "not on board".into(),
+            };
+            out.append_styled(
+                format!("{:>4}  {} {:>16} {:>6.2}%  {rank_text}\n", format!("#{}", i + 1), fit(&name, 22), zats(Some(m.power)), pct(m.power, total_power)),
+                if me { green } else { plain },
+            );
+        }
     }
     append_board_error(&mut out, snap, warn);
     out
@@ -451,8 +606,35 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
 
 fn append_board_error(out: &mut StyledString, snap: &Snap, style: ColorStyle) {
     if let Some(e) = &snap.board_error {
-        out.append_styled(format!("Last refresh failed: {}. Showing the previous board.\n", brief(e)), style);
+        let since = snap
+            .board_fetched_at
+            .map(|t| format!(" from {} ago", age(secs_since(t))))
+            .unwrap_or_default();
+        out.append_styled(format!("Last refresh failed: {}. Showing the previous board{since}.\n", brief(e)), style);
     }
+}
+
+/// A warning for panels built from node RPC data while the node is not answering.
+pub fn node_stale_note(snap: &Snap) -> Option<String> {
+    snap.rpc_error.as_ref()?;
+    Some(match snap.rpc_ok_at {
+        Some(t) => format!(
+            "NOT LIVE: the node RPC has not answered for {}. Values below are from {} and may be out of date.",
+            age(secs_since(t)),
+            t.with_timezone(&chrono::Local).format("%H:%M:%S")
+        ),
+        None => "NOT LIVE: the node RPC has not answered since the TUI started. Nothing below is current.".into(),
+    })
+}
+
+/// Prefixes a node-derived panel with the not-live warning when the node RPC is down.
+pub fn with_stale_note(snap: &Snap, body: String) -> StyledString {
+    let mut out = StyledString::new();
+    if let Some(note) = node_stale_note(snap) {
+        out.append_styled(format!("{note}\n{RULE}\n"), ColorStyle::title_secondary());
+    }
+    out.append_plain(body);
+    out
 }
 
 fn fg(color: Color) -> ColorStyle {
@@ -807,6 +989,91 @@ mod tests {
         assert!(!text.contains("does not stake"), "{text}");
         assert!(!text.contains("Refreshes"), "{text}");
         assert!(!text.contains("Staking window"), "{text}");
+    }
+
+    fn board(observed_at: &str, max_age: i64) -> Value {
+        json!({
+            "milestones": {"roster_snapshot": 34560, "bft_activation": 36288},
+            "staking": {
+                "height": 35289,
+                "observed_at": observed_at,
+                "max_age_seconds": max_age,
+                "finalizers": [
+                    {"public_key": "0102", "finalizer_address": "zfinv1_a", "active_amount_zats": 300, "active_bond_count": 3},
+                    {"public_key": "0304", "finalizer_address": "zfinv1_b", "active_amount_zats": 200, "active_bond_count": 2},
+                    {"public_key": "0506", "finalizer_address": "zfinv1_c", "active_amount_zats": 100, "active_bond_count": 1}
+                ]
+            }
+        })
+    }
+
+    fn rfc3339_ago(secs: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::seconds(secs)).to_rfc3339()
+    }
+
+    #[test]
+    fn fresh_board_shows_its_age_and_block() {
+        let mut snap = Snap::default();
+        snap.chain = json!({"blocks": 35291});
+        snap.board = board(&rfc3339_ago(20), 75);
+        let age = board_age(&snap);
+        assert!(!age.expired, "{}", age.text);
+        assert!(age.text.contains("block 35289 (2 behind your node)"), "{}", age.text);
+        assert!(top_stakers(&snap).source().contains("valid for 75s"));
+    }
+
+    #[test]
+    fn board_past_its_limit_is_marked_expired() {
+        let mut snap = Snap::default();
+        snap.board = board(&rfc3339_ago(600), 75);
+        let age = board_age(&snap);
+        assert!(age.expired);
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("EXPIRED"), "{text}");
+        assert!(text.contains("10m ago"), "{text}");
+    }
+
+    #[test]
+    fn without_a_roster_the_cutoff_is_only_a_projection() {
+        let mut snap = Snap::default();
+        snap.board = board(&rfc3339_ago(5), 75);
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("not committee membership"), "{text}");
+        assert!(text.contains("Committee: not formed yet"), "{text}");
+        assert!(text.contains("BFT starts at block 36288"), "{text}");
+        assert!(!text.contains("Committee from your node"), "{text}");
+    }
+
+    #[test]
+    fn roster_decides_seats_not_bonded_rank() {
+        let mut snap = Snap::default();
+        snap.board = board(&rfc3339_ago(5), 75);
+        // Seat for b by address, seat for c by its key in the opposite byte order; a has no seat.
+        snap.roster = json!([
+            {"pub_key": "aaaa", "finalizer_address": "zfinv1_b", "voting_power": 900},
+            {"pub_key": "0605", "voting_power": 100}
+        ]);
+        let text = top_stakers(&snap).source().to_string();
+        assert!(text.contains("Committee: 2 seats"), "{text}");
+        // Table rows start with the right-aligned rank; the legend line above starts with a block.
+        let row = |pk: &str| text.lines().find(|l| l.starts_with("  ") && l.contains(pk)).unwrap_or("").to_string();
+        assert!(row("0102").contains("none"), "{text}");
+        assert!(row("0304").contains("#1"), "{text}");
+        assert!(row("0506").contains("#2"), "{text}");
+        assert!(text.contains("Committee from your node"), "{text}");
+        assert!(text.contains("#2 (differs)"), "{text}");
+    }
+
+    #[test]
+    fn unreachable_node_is_flagged_not_live() {
+        let mut snap = Snap::default();
+        assert!(node_stale_note(&snap).is_none());
+        snap.rpc_error = Some("connection refused".into());
+        snap.rpc_ok_at = Some(chrono::Utc::now() - chrono::Duration::seconds(95));
+        let note = node_stale_note(&snap).unwrap();
+        assert!(note.starts_with("NOT LIVE"), "{note}");
+        assert!(note.contains("95s"), "{note}");
+        assert!(with_stale_note(&snap, "body".into()).source().ends_with("body"));
     }
 
     #[test]

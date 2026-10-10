@@ -15,13 +15,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--log-file PATH] [--service NAME]
+const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--log-file PATH] [--service NAME] [--read-only]
 
   --config PATH    zebrad.toml to manage (default: the -c path in the systemd unit's ExecStart,
                    else zebrad's default location for this OS)
   --rpc URL        node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
   --log-file PATH  read node logs from this file (default on Linux: the unit's journal)
   --service NAME   systemd unit running zebrad, Linux only (default: zebra-crosslink)
+  --read-only      watch only: no staking actions, config edits or start/stop/restart, so it is
+                   safe next to scripts that manage the node, or pointed at a remote node
 
 Works in any terminal, including tmux:  tmux new -A -s crosslink crosslink-tui";
 
@@ -30,6 +32,7 @@ fn main() {
     let mut config_arg = None;
     let mut rpc_arg = None;
     let mut log_file = None;
+    let mut read_only = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -37,6 +40,7 @@ fn main() {
             "--config" => config_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--rpc" => rpc_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--log-file" => log_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage_exit()))),
+            "--read-only" => read_only = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -89,6 +93,7 @@ fn main() {
             pending.clone(),
             want_logs.clone(),
             panel.clone(),
+            read_only,
         );
         ui::build(&mut siv, app);
 
