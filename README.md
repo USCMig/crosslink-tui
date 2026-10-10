@@ -15,7 +15,7 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 | Peers and Sync | PoW peers (address, direction, agent, last message, ping) and BFT peers |
 | Mining | Edit the internal miner's payout address, threads, enabled and low-priority settings; shows running solvers and any GPU solver configured in systemd |
 | Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw `staking_command` editor |
-| Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. The voting roster stays empty until the snapshot |
+| Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. Shows how old the ranking is and greys it out once it passes the index's own freshness limit. A `seat` column shows actual committee membership from the node's voting roster, kept separate from bonded rank; until BFT starts the roster is empty and the top-12 line is labelled a projection |
 | BFT Finality | `get_tfl_finality_status`, `get_tfl_quorum_status`, `get_tfl_round_diagnosis`, `get_tfl_bft_internal_stats`, `get_tfl_bft_block` |
 | Config | Every value in `zebrad.toml`: edit, add, remove, save, reload, or open in `$EDITOR` |
 | Node Control | Service state; start, stop and restart with `sudo systemctl`, or a quick restart without sudo (Linux with systemd) |
@@ -63,6 +63,19 @@ Options:
 --rpc URL        node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
 --log-file PATH  read node logs from this file (default on Linux: the unit's journal)
 --service NAME   systemd unit running zebrad, Linux only (default: zebra-crosslink)
+--read-only      watch only: no staking actions, config edits or start/stop/restart
+```
+
+### Read-only mode
+
+`--read-only` turns the TUI into a monitor. It hides every control that changes something (staking
+and bond actions, config edits and saves, `$EDITOR`, start, stop and restart) and refuses those
+actions even if one is reached another way. The header shows `READ-ONLY`. Use it to watch a node
+that scripts or other tools already manage, or a node on another machine through `--rpc`.
+
+```sh
+crosslink-tui --read-only
+crosslink-tui --read-only --rpc http://10.0.0.5:8232   # a remote node; logs and service control need it local
 ```
 
 zebrad's default config locations are `~/.config/zebrad.toml` (Linux),
@@ -158,6 +171,11 @@ patch updated.
 | Q | Quit |
 
 ## Notes
+
+- **Data age:** if the node's RPC stops answering, the header shows `NOT LIVE` and node panels say
+  how long ago their values were last current. The Top Stakers ranking shows the block and time the
+  index observed, and is marked `EXPIRED` once it is older than the index's `max_age_seconds`
+  (75 seconds today), because a failed refresh keeps the previous list on screen.
 
 - **Restarts:** Start, Stop and Restart run `sudo systemctl ...`. The TUI steps aside so you can type
   your sudo password, then comes back. Quick restart sends SIGTERM to the node and relies on the

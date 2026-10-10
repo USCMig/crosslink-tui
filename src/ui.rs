@@ -39,6 +39,8 @@ pub struct App {
     pub panel: Arc<Mutex<String>>,
     pub log_filter: usize,
     pub hide_noise: bool,
+    /// Started with --read-only: nothing that changes the node, its wallet or its config runs.
+    pub read_only: bool,
     last_roster: Vec<String>,
     last_bonds: Vec<String>,
 }
@@ -55,8 +57,12 @@ impl App {
         pending: Arc<Mutex<Option<Pending>>>,
         want_logs: Arc<AtomicBool>,
         panel: Arc<Mutex<String>>,
+        read_only: bool,
     ) -> Self {
-        Self { snap, cfg, rpc, service, argv, log_desc, pending, want_logs, panel, log_filter: 0, hide_noise: true, last_roster: Vec::new(), last_bonds: Vec::new() }
+        Self {
+            snap, cfg, rpc, service, argv, log_desc, pending, want_logs, panel,
+            log_filter: 0, hide_noise: true, read_only, last_roster: Vec::new(), last_bonds: Vec::new(),
+        }
     }
 }
 
@@ -93,6 +99,18 @@ fn info(s: &mut Cursive, title: &str, text: impl Into<String>) {
     s.add_layer(Dialog::info(text.into()).title(title));
 }
 
+/// True (after telling the user why) when the TUI runs read-only. Every action that writes to the
+/// node, its wallet or its config calls this first, even when its button is already hidden.
+fn blocked(s: &mut Cursive) -> bool {
+    if !app(s).read_only {
+        return false;
+    }
+    info(s, "Read-only mode", "This TUI was started with --read-only, so it does not change the node, its wallet or its config.");
+    true
+}
+
+const READ_ONLY_NOTE: &str = "Read-only mode (--read-only): actions are turned off on this panel.";
+
 fn edit_content(s: &mut Cursive, name: &str) -> String {
     s.call_on_name(name, |v: &mut EditView| v.get_content().to_string()).unwrap_or_default()
 }
@@ -124,6 +142,7 @@ pub fn build(siv: &mut Cursive, app_state: App) {
     apply_theme(siv);
     let start = app_state.panel.lock().unwrap().clone();
     let cfg = app_state.cfg.clone();
+    let ro = app_state.read_only;
     siv.set_user_data(app_state);
 
     let mut menu = SelectView::<&'static str>::new();
@@ -149,12 +168,12 @@ pub fn build(siv: &mut Cursive, app_state: App) {
         let cfg = cfg.lock().unwrap();
         stack.add_fullscreen_layer(Layer::new(text_panel("version_text").full_screen()).with_name("version_panel"));
         stack.add_fullscreen_layer(Layer::new(logs_panel().full_screen()).with_name("logs_panel"));
-        stack.add_fullscreen_layer(Layer::new(control_panel().full_screen()).with_name("control_panel"));
-        stack.add_fullscreen_layer(Layer::new(config_panel().full_screen()).with_name("config_panel"));
+        stack.add_fullscreen_layer(Layer::new(control_panel(ro).full_screen()).with_name("control_panel"));
+        stack.add_fullscreen_layer(Layer::new(config_panel(ro).full_screen()).with_name("config_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("bft_text").full_screen()).with_name("bft_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("stakers_text").full_screen()).with_name("stakers_panel"));
-        stack.add_fullscreen_layer(Layer::new(staking_panel().full_screen()).with_name("staking_panel"));
-        stack.add_fullscreen_layer(Layer::new(mining_panel(&cfg).full_screen()).with_name("mining_panel"));
+        stack.add_fullscreen_layer(Layer::new(staking_panel(ro).full_screen()).with_name("staking_panel"));
+        stack.add_fullscreen_layer(Layer::new(mining_panel(&cfg, ro).full_screen()).with_name("mining_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("peers_text").full_screen()).with_name("peers_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("basic_text").full_screen()).with_name("basic_panel"));
     }
@@ -235,6 +254,7 @@ pub fn refresh(s: &mut Cursive) {
         (c.path.display().to_string(), c.get_int(&["mining", "internal_miner_threads"]), c.dirty)
     };
     let panel = a.panel.lock().unwrap().clone();
+    let read_only = a.read_only;
 
     let build = snap.info.get("build").and_then(Value::as_str).unwrap_or("?").to_string();
     let mut header = StyledString::styled(format!("Crosslink Node {build} [Crosslink Feature Net]"), ColorStyle::title_primary());
@@ -242,23 +262,29 @@ pub fn refresh(s: &mut Cursive) {
     if dirty {
         header.append_styled("    config: unsaved changes", ColorStyle::title_secondary());
     }
+    if read_only {
+        header.append_styled("    READ-ONLY", ColorStyle::title_secondary());
+    }
+    if snap.rpc_error.is_some() {
+        header.append_styled("    NOT LIVE", ColorStyle::title_secondary());
+    }
     set_text(s, "header", header);
 
     // Only the visible panel is re-rendered; switching panels triggers a refresh.
     match panel.as_str() {
-        "basic" => set_text(s, "basic_text", render::basic(&snap)),
-        "peers" => set_text(s, "peers_text", render::peers(&snap)),
+        "basic" => set_text(s, "basic_text", render::with_stale_note(&snap, render::basic(&snap))),
+        "peers" => set_text(s, "peers_text", render::with_stale_note(&snap, render::peers(&snap))),
         "mining" => {
             let env = snap.service.get("Environment").cloned();
-            set_text(s, "mining_text", render::mining_status(&snap, threads, env.as_deref()));
+            set_text(s, "mining_text", render::with_stale_note(&snap, render::mining_status(&snap, threads, env.as_deref())));
         }
         "staking" => {
-            set_text(s, "staking_text", render::staking(&snap));
+            set_text(s, "staking_text", render::with_stale_note(&snap, render::staking(&snap)));
             refresh_roster(s, &snap);
             refresh_bonds(s, &snap);
         }
         "stakers" => set_text(s, "stakers_text", render::top_stakers(&snap)),
-        "bft" => set_text(s, "bft_text", render::bft(&snap)),
+        "bft" => set_text(s, "bft_text", render::with_stale_note(&snap, render::bft(&snap))),
         "config" => set_text(s, "config_status", config_status(&config_path, dirty)),
         "control" => set_text(s, "control_text", render::node_control(&snap, &service)),
         "logs" => set_text(s, "logs_text", render::logs(&snap, filter, hide)),
@@ -270,7 +296,21 @@ pub fn refresh(s: &mut Cursive) {
 // ---------------------------------------------------------------------------------------------
 // Mining
 
-fn mining_panel(cfg: &ConfigFile) -> impl View {
+fn mining_panel(cfg: &ConfigFile, read_only: bool) -> impl View {
+    if read_only {
+        let (enabled, addr, threads, low) = mining_values(cfg);
+        let settings = format!(
+            "Internal miner enabled:  {enabled}\nPayout address:          {addr}\nMining threads:          {threads}\nLow CPU priority:        {low}"
+        );
+        return LinearLayout::vertical()
+            .child(TextView::new("Loading...").with_name("mining_text"))
+            .child(DummyView)
+            .child(heading("Miner settings ([mining] in the config file, as loaded)"))
+            .child(TextView::new(settings))
+            .child(DummyView)
+            .child(TextView::new(READ_ONLY_NOTE).style(ColorStyle::secondary()))
+            .scrollable();
+    }
     let form = ListView::new()
         .child("Internal miner enabled", Checkbox::new().with_name("m_enabled"))
         .child("Payout address", EditView::new().with_name("m_address").min_width(44))
@@ -333,6 +373,9 @@ fn fill_mining_form(s: &mut Cursive) {
 }
 
 fn save_mining(s: &mut Cursive) -> bool {
+    if blocked(s) {
+        return false;
+    }
     let enabled = checked(s, "m_enabled");
     let low = checked(s, "m_low");
     let address = edit_content(s, "m_address").trim().to_string();
@@ -380,15 +423,28 @@ fn save_mining(s: &mut Cursive) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Staking
 
-fn staking_panel() -> impl View {
+fn staking_panel(read_only: bool) -> impl View {
     let roster = SelectView::<Option<String>>::new()
         .on_submit(|s, addr: &Option<String>| stake(s, addr.clone()))
         .with_name("roster");
     let bonds = SelectView::<(String, bool)>::new().with_name("bonds");
+    if read_only {
+        return LinearLayout::vertical()
+            .child(TextView::new("Loading...").with_name("staking_text"))
+            .child(DummyView)
+            .child(heading("Committee: the node's voting roster (get_tfl_roster_zats)"))
+            .child(roster.scrollable().max_height(10))
+            .child(DummyView)
+            .child(heading("My bonds (wallet_staking_positions)"))
+            .child(bonds.scrollable().max_height(8))
+            .child(DummyView)
+            .child(TextView::new(READ_ONLY_NOTE).style(ColorStyle::secondary()))
+            .scrollable();
+    }
     LinearLayout::vertical()
         .child(TextView::new("Loading...").with_name("staking_text"))
         .child(DummyView)
-        .child(heading("Roster (get_tfl_roster_zats). Enter stakes to the highlighted finalizer"))
+        .child(heading("Committee: the node's voting roster (get_tfl_roster_zats). Enter stakes to the highlighted finalizer"))
         .child(roster.scrollable().max_height(10))
         .child(DummyView)
         .child(ListView::new().child("Amount (cTAZ)", EditView::new().with_name("stake_amount").fixed_width(18)))
@@ -508,6 +564,9 @@ fn window_open(s: &mut Cursive) -> bool {
 }
 
 fn stake(s: &mut Cursive, target: Option<String>) {
+    if blocked(s) {
+        return;
+    }
     let Some(target) = target else {
         info(s, "Stake", "That roster entry has no finalizer address.");
         return;
@@ -528,6 +587,9 @@ fn stake(s: &mut Cursive, target: Option<String>) {
 }
 
 fn bond_action(s: &mut Cursive, kind: &str) {
+    if blocked(s) {
+        return;
+    }
     let sel = s
         .call_on_name("bonds", |v: &mut SelectView<(String, bool)>| v.selection().map(|x| (*x).clone()))
         .flatten();
@@ -558,6 +620,9 @@ fn bond_action(s: &mut Cursive, kind: &str) {
 }
 
 fn raw_action(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
     let mine = app(s).snap.lock().unwrap().finalizer_address.clone().unwrap_or("<zfin address>".into());
     let templates = vec![
         ("CreateNewDelegationBond", json!({"CreateNewDelegationBond": {"amount_zats": 1_000_000_000u64, "target_finalizer": mine}})),
@@ -612,6 +677,9 @@ fn confirm_staking(s: &mut Cursive, question: String, action: Value) {
 }
 
 fn submit_staking(s: &mut Cursive, action: Value) {
+    if blocked(s) {
+        return;
+    }
     let rpc = app(s).rpc.clone();
     let sink = s.cb_sink().clone();
     s.add_layer(
@@ -637,7 +705,35 @@ fn submit_staking(s: &mut Cursive, action: Value) {
 // ---------------------------------------------------------------------------------------------
 // Config
 
-fn config_panel() -> impl View {
+fn config_panel(read_only: bool) -> impl View {
+    if read_only {
+        return LinearLayout::vertical()
+            .child(TextView::new("").with_name("config_status"))
+            .child(DummyView)
+            .child(
+                SelectView::<usize>::new()
+                    .on_submit(|s, i: &usize| edit_entry(s, *i))
+                    .with_name("config_list")
+                    .scrollable()
+                    .full_height(),
+            )
+            .child(DummyView)
+            .child(
+                LinearLayout::horizontal()
+                    .child(Button::new("Reload", |s| {
+                        let res = app(s).cfg.lock().unwrap().reload();
+                        match res {
+                            Ok(()) => {
+                                refresh_config_list(s);
+                                refresh(s);
+                            }
+                            Err(e) => info(s, "Reload failed", e),
+                        }
+                    }))
+                    .child(DummyView)
+                    .child(TextView::new(READ_ONLY_NOTE).style(ColorStyle::secondary())),
+            );
+    }
     LinearLayout::vertical()
         .child(TextView::new("").with_name("config_status"))
         .child(DummyView)
@@ -709,6 +805,9 @@ fn selected_entry(s: &mut Cursive) -> Option<usize> {
 }
 
 fn edit_entry(s: &mut Cursive, i: usize) {
+    if blocked(s) {
+        return;
+    }
     let entries = app(s).cfg.lock().unwrap().entries();
     let Some(e) = entries.get(i) else { return };
     if !e.editable {
@@ -746,6 +845,9 @@ fn edit_entry(s: &mut Cursive, i: usize) {
 }
 
 fn add_entry(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
     s.add_layer(
         Dialog::around(
             ListView::new()
@@ -779,6 +881,9 @@ fn add_entry(s: &mut Cursive) {
 }
 
 fn remove_entry(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
     let Some(i) = selected_entry(s) else { return };
     let entries = app(s).cfg.lock().unwrap().entries();
     let Some(e) = entries.get(i) else { return };
@@ -803,6 +908,9 @@ fn remove_entry(s: &mut Cursive) {
 
 /// Saves the shared config document. Refuses to overwrite a file someone else changed.
 fn save_config(s: &mut Cursive) -> bool {
+    if blocked(s) {
+        return false;
+    }
     let cfg = app(s).cfg.clone();
     if cfg.lock().unwrap().changed_on_disk() {
         s.add_layer(
@@ -853,6 +961,9 @@ fn saved_offer_restart(s: &mut Cursive) {
 }
 
 fn open_editor(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
     let go = |s: &mut Cursive| {
         let editor = node::default_editor();
         let path = app(s).cfg.lock().unwrap().path.display().to_string();
@@ -879,7 +990,14 @@ fn open_editor(s: &mut Cursive) {
 // ---------------------------------------------------------------------------------------------
 // Node control and logs
 
-fn control_panel() -> impl View {
+fn control_panel(read_only: bool) -> impl View {
+    if read_only {
+        return LinearLayout::vertical()
+            .child(TextView::new("Loading...").with_name("control_text"))
+            .child(DummyView)
+            .child(TextView::new(READ_ONLY_NOTE).style(ColorStyle::secondary()))
+            .scrollable();
+    }
     LinearLayout::vertical()
         .child(TextView::new("Loading...").with_name("control_text"))
         .child(DummyView)
@@ -918,6 +1036,9 @@ fn managed(s: &mut Cursive) -> bool {
 }
 
 fn run_sudo(s: &mut Cursive, op: &str) {
+    if blocked(s) {
+        return;
+    }
     if !managed(s) {
         return;
     }
@@ -928,6 +1049,9 @@ fn run_sudo(s: &mut Cursive, op: &str) {
 }
 
 fn quick_restart(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
     if !managed(s) {
         return;
     }
