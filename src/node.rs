@@ -178,6 +178,14 @@ pub fn finalizer_address(src: &LogSource) -> Option<String> {
     addr.starts_with("zfin").then_some(addr)
 }
 
+/// The git commit zebrad was built from, from the `git commit: 68a076c` line it logs at startup.
+pub fn git_commit(src: &LogSource) -> Option<String> {
+    let l = last_line_with(src, "git commit: ")?;
+    let i = l.find("git commit: ")?;
+    let hex: String = l[i + 12..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    (hex.len() >= 7).then_some(hex.to_ascii_lowercase())
+}
+
 pub fn running_solvers(src: &LogSource) -> Option<String> {
     let l = last_line_with(src, "solver_count=")?;
     let i = l.find("solver_count=")?;

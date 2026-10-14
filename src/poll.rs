@@ -64,6 +64,8 @@ pub struct Snap {
     pub disk_bytes: Option<u64>,
     pub finalizer_address: Option<String>,
     pub solvers: Option<String>,
+    /// The git commit the node was built from, from its startup log.
+    pub node_commit: Option<String>,
     pub positions: Value,
     /// RPCs this node build answered with "Method not found".
     pub missing_rpcs: BTreeSet<String>,
@@ -98,7 +100,7 @@ impl Poller {
         let mut last_pid = String::new();
         let lookup_busy = Arc::new(AtomicBool::new(false));
         let board_busy = Arc::new(AtomicBool::new(false));
-        let found: Arc<Mutex<(Option<String>, Option<String>)>> = Arc::default();
+        let found: Arc<Mutex<(Option<String>, Option<String>, Option<String>)>> = Arc::default();
         let board_slot: Arc<Mutex<Option<Result<Value, String>>>> = Arc::default();
         let mut last_mining = None::<Instant>;
         let mut last_spacing = None::<Instant>;
@@ -136,17 +138,20 @@ impl Poller {
                 last_lookup = Some(Instant::now());
                 let (src, found, busy) = (self.log_source.clone(), found.clone(), lookup_busy.clone());
                 std::thread::spawn(move || {
-                    let r = (node::finalizer_address(&src), node::running_solvers(&src));
+                    let r = (node::finalizer_address(&src), node::running_solvers(&src), node::git_commit(&src));
                     *found.lock().unwrap() = r;
                     busy.store(false, Ordering::Relaxed);
                 });
             }
             {
-                let (addr, solvers) = &*found.lock().unwrap();
+                let (addr, solvers, commit) = &*found.lock().unwrap();
                 if addr.is_some() {
                     s.finalizer_address = addr.clone();
                 }
                 s.solvers = solvers.clone();
+                if commit.is_some() {
+                    s.node_commit = commit.clone();
+                }
             }
 
             // The board is a public HTTP document, so fetch it off this loop (a slow TLS

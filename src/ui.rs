@@ -258,8 +258,11 @@ pub fn refresh(s: &mut Cursive) {
     let panel = a.panel.lock().unwrap().clone();
     let read_only = a.read_only;
 
-    let build = snap.info.get("build").and_then(Value::as_str).unwrap_or("?").to_string();
-    let mut header = StyledString::styled(format!("Crosslink Node {build} [Crosslink Feature Net]"), ColorStyle::title_primary());
+    // The Crosslink release (v15) when the node's build commit is a release tag, else zebrad's own
+    // version, which is the Zebra version Crosslink builds on.
+    let release = crate::upgrade::node_release_short(snap.node_commit.as_deref(), &snap.info, &snap.chain)
+        .unwrap_or_else(|| snap.info.get("build").and_then(Value::as_str).unwrap_or("?").to_string());
+    let mut header = StyledString::styled(format!("Crosslink Node {release} [Crosslink Feature Net]"), ColorStyle::title_primary());
     header.append_plain(format!("    {}", render::status_word(&snap)));
     if let Some((bft, warn)) = render::bft_header(&snap) {
         if warn {

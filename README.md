@@ -11,7 +11,7 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 
 | Panel | What it does |
 |---|---|
-| Basic Status | Sync state, peers, disk use, chain tip, v15 network upgrade status, BFT finality summary, mempool, wallet balances |
+| Basic Status | Node release (for example v15), sync state, peers, disk use, chain tip, v15 network upgrade status, BFT finality summary, mempool, wallet balances |
 | Peers and Sync | PoW peers (address, direction, agent, last message, ping) and BFT peers |
 | Mining | Edit the internal miner's payout address, threads, enabled and low-priority settings; shows running solvers and any GPU solver configured in systemd. Mining health: blocks found in the last hour and day, share of blocks and the Sol/s it implies, and, from the node's logs, accepted and rejected submits, blocks orphaned after acceptance, solutions discarded before submit, and GPU solver failures |
 | Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw staking-action editor. On v15 nodes, enforces power-of-10 bond amounts and offers the nearest valid amounts |
@@ -20,9 +20,9 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 | Config | Every value in `zebrad.toml`: edit, add, remove, save, reload, or open in `$EDITOR` |
 | Node Control | Service state; start, stop and restart with `sudo systemctl`, or a quick restart without sudo (Linux with systemd) |
 | Logs | Live node logs with filters (warnings, mining, staking/BFT, wallet) |
-| Version Info | Build, protocol version, network upgrade status, which staking RPC the node uses, binary, config, unit and drop-in files, finalizer address |
+| Version Info | Node release and the Zebra version it is based on, protocol version, network upgrade status, which staking RPC the node uses, binary, config, unit and drop-in files, finalizer address |
 
-The header shows the node's status, its BFT height (`BFT STALLED` after 5 minutes without a
+The header shows the node's release (for example `Crosslink Node v15`), its status, its BFT height (`BFT STALLED` after 5 minutes without a
 decision), and `UPGRADE NODE TO v15` when the node still runs v14.
 
 Config saves keep comments and layout, write a timestamped `.bak` next to the file first, and refuse
@@ -225,6 +225,11 @@ A later node release may already include these RPCs, or may need the patch updat
   fill in over the first hour. The block browser reads any decided BFT block by height.
 - **Finalizer address:** this node's finalizer address is read from the startup line zebrad writes
   to its log.
+- **Node release:** zebrad logs the git commit it was built from at startup. When that commit is an
+  upstream release tag, the TUI names the release (`v15 (commit 68a076c)`); a build with local
+  patches on top of a tag still reports the tag's commit. Without the log (a remote node), the release
+  family is inferred from the protocol version (`v15 or later`). `zebrad build` (`v6.2.3`) is the
+  Zebra version Crosslink is based on, not the Crosslink release.
 - **One outbound request:** the Top Stakers page fetches the public roster document at
   `https://ctaz.cash/v14/api/roster` about every 45 seconds. It is a plain GET that sends no node or
   wallet data, but that site sees your IP address. Every other panel talks only to your own node.

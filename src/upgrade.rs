@@ -30,6 +30,44 @@ pub fn node_is_v15(info: &Value, chain: &Value) -> bool {
     scheduled(chain).is_some() || info.get("protocolversion").and_then(Value::as_u64).is_some_and(|p| p >= V15_PROTOCOL)
 }
 
+/// Commits of the upstream release tags (`ShieldedLabs/crosslink_monolith`). Where two tags share a
+/// commit, the final release is listed first so it wins.
+const RELEASES: &[(&str, &str)] = &[
+    ("v15", "68a076cf3c866c339a89b5684eccea64a4229d7a"),
+    ("v14", "eca0207c19469df3abd9da8290bf0aea94da8642"),
+    ("v13", "807b995223b6e663cad4cb9890f4ade7dd320295"),
+    ("v12", "6d19ec06268ec6f92db0f01e290540032666ef20"),
+    ("v12_rc1", "82c5ab383320bbcefffc747217d3381a0fce9bf6"),
+    ("s2v11", "2c346b29c06ec19cd5ad4e58752d531888342157"),
+    ("s2v10", "b2373576294fc6db1f4254d785c2e5c1a2cf24fe"),
+    ("s2v9", "164d7bee065462b627aaa7b030619e82b22f6c75"),
+    ("s2v8", "52082e07d8326dda47c69f2994d68e2088aff778"),
+];
+
+/// The node's release: by name when its build commit is a release tag, otherwise from what it
+/// reports over RPC. The commit comes from the node's startup log, so it is only known when the
+/// TUI can read that log.
+pub fn node_release(commit: Option<&str>, info: &Value, chain: &Value) -> String {
+    if let Some(c) = commit.filter(|c| c.len() >= 7) {
+        if let Some((tag, _)) = RELEASES.iter().find(|(_, full)| full.starts_with(c)) {
+            return format!("{tag} (commit {})", &c[..7]);
+        }
+        let family = if node_is_v15(info, chain) { "v15 or later" } else { "before v15" };
+        return format!("{family}, untagged build (commit {})", &c[..c.len().min(7)]);
+    }
+    if info.is_null() {
+        return "-".into();
+    }
+    if node_is_v15(info, chain) { "v15 or later (from its protocol version)".into() } else { "v14 or earlier (from its protocol version)".into() }
+}
+
+/// Short form for the title bar: the tag alone when known.
+pub fn node_release_short(commit: Option<&str>, info: &Value, chain: &Value) -> Option<String> {
+    let c = commit.filter(|c| c.len() >= 7)?;
+    RELEASES.iter().find(|(_, full)| full.starts_with(c)).map(|(tag, _)| tag.to_string())
+        .or_else(|| Some(if node_is_v15(info, chain) { "v15+".into() } else { "pre-v15".into() }))
+}
+
 pub fn is_power_of_10(mut n: u64) -> bool {
     if n == 0 {
         return false;
@@ -91,6 +129,17 @@ mod tests {
         assert_eq!(nearest_powers_of_10(1_250_000_000), (1_000_000_000, 10_000_000_000));
         assert_eq!(nearest_powers_of_10(100), (100, 100));
         assert_eq!(nearest_powers_of_10(7), (1, 10));
+    }
+
+    #[test]
+    fn names_the_node_release_from_its_commit() {
+        let v15 = (json!({"protocolversion": 170165}), json!({}));
+        assert_eq!(node_release(Some("68a076c"), &v15.0, &v15.1), "v15 (commit 68a076c)");
+        assert_eq!(node_release(Some("eca0207c19"), &json!({"protocolversion": 170160}), &json!({})), "v14 (commit eca0207)");
+        assert!(node_release(Some("1234567"), &v15.0, &v15.1).starts_with("v15 or later, untagged"));
+        assert_eq!(node_release(None, &v15.0, &v15.1), "v15 or later (from its protocol version)");
+        assert_eq!(node_release_short(Some("68a076c"), &v15.0, &v15.1).as_deref(), Some("v15"));
+        assert_eq!(node_release_short(None, &v15.0, &v15.1), None);
     }
 
     #[test]

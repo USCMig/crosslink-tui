@@ -113,6 +113,7 @@ pub fn staking_window(height: u64) -> (bool, String) {
 pub fn basic(snap: &Snap) -> String {
     let mut o = String::new();
     line(&mut o, "Current Status", status_word(snap));
+    line(&mut o, "Node Release", crate::upgrade::node_release(snap.node_commit.as_deref(), &snap.info, &snap.chain));
     line(&mut o, "Connected Peers", opt(u(&snap.info, "connections")));
     line(&mut o, "Disk Usage (GB)", snap.disk_bytes.map(|b| format!("{:.3}", b as f64 / 1e9)).unwrap_or("-".into()));
     o.push_str(RULE);
@@ -1118,7 +1119,8 @@ pub fn node_control(snap: &Snap, service: &str) -> String {
 pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[String], logs: &str) -> String {
     let mut o = String::new();
     line(&mut o, "TUI version", env!("CARGO_PKG_VERSION"));
-    line(&mut o, "zebrad build", s(&snap.info, "build"));
+    line(&mut o, "Node release", crate::upgrade::node_release(snap.node_commit.as_deref(), &snap.info, &snap.chain));
+    line(&mut o, "zebrad build", format!("{} (the Zebra version Crosslink is based on)", s(&snap.info, "build")));
     line(&mut o, "zebrad subversion", s(&snap.info, "subversion"));
     line(&mut o, "Protocol version", opt(u(&snap.info, "protocolversion")));
     let tip = u(&snap.chain, "blocks").unwrap_or(0);
