@@ -631,23 +631,25 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
     let widths = alloc_widths(&parts, POOL_W);
     let palette = [yellow, cyan, plain, magenta];
     for (i, w) in widths.iter().copied().enumerate() {
-        let (style, ch) = if i < shown && rows[i].me {
-            (green, "█")
+        let style = if i < shown && rows[i].me {
+            green
         } else if rest > 0 && i + 1 == widths.len() {
-            (dim, "░")
+            dim
         } else {
-            (palette.get(i).copied().unwrap_or(dim), "█")
+            palette.get(i).copied().unwrap_or(dim)
         };
-        out.append_styled(ch.repeat(w), live(style));
+        paint(&mut out, w, solid_from(live(style)));
     }
     out.append_plain("\n");
     for i in 0..shown {
         let style = if rows[i].me { green } else { palette[i] };
         let name = legend_name(&rows[i]);
-        out.append_styled(format!("█ {name} {:.1}%  ", pct(rows[i].amount, total)), live(style));
+        paint(&mut out, 2, solid_from(live(style)));
+        out.append_styled(format!(" {name} {:.1}%  ", pct(rows[i].amount, total)), live(style));
     }
     if rest > 0 {
-        out.append_styled(format!("░ other {:.1}%", pct(rest, total)), dim);
+        paint(&mut out, 2, solid_from(dim));
+        out.append_styled(format!(" other {:.1}%", pct(rest, total)), dim);
     }
     out.append_plain("\n");
     out.append_styled(format!("{:>3}  {:<22} {:>14} {:>7} {:>5}  {:<8} \n", "#", "name", "cTAZ", "share", "bonds", "seat"), dim);
@@ -676,7 +678,6 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
             (true, None) => "none".to_string(),
         };
         let filled = blocks(row.amount, leader, BAR_W);
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
         out.append_styled(
             format!(
                 "{rank:>3}  {} {:>14} {:>6.2}% {:>5}  {:<8} ",
@@ -688,7 +689,10 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
             ),
             live(text_style),
         );
-        out.append_styled(bar, live(bar_style));
+        // Both parts are spaces. The fill is the bar color and the rest is a darker trough,
+        // so a font that draws U+2588 and U+2591 as the same dash cannot flatten the chart.
+        paint(&mut out, filled, solid_from(live(bar_style)));
+        paint(&mut out, BAR_W - filled, solid(BAR_TRACK));
         out.append_plain("\n");
     }
 
@@ -754,6 +758,27 @@ pub fn with_stale_note(snap: &Snap, body: String) -> StyledString {
 fn fg(color: Color) -> ColorStyle {
     ColorStyle::new(color, Color::TerminalDefault)
 }
+
+/// A cell whose foreground and background are the same color. A space drawn this way is a solid
+/// swatch. U+2588 FULL BLOCK and U+2591 LIGHT SHADE are one glyph in some fonts, so a bar made
+/// of them is the same length on every row.
+fn solid(color: Color) -> ColorStyle {
+    ColorStyle::new(color, color)
+}
+
+fn solid_from(style: ColorStyle) -> ColorStyle {
+    ColorStyle { front: style.front, back: style.front }
+}
+
+fn paint(out: &mut StyledString, cells: usize, style: ColorStyle) {
+    if cells > 0 {
+        out.append_styled(" ".repeat(cells), style);
+    }
+}
+
+/// Empty part of a row bar. Dark gray from the 256-color cube, so it still reads as a trough
+/// where truecolor is unavailable, and it does not depend on a shade glyph.
+const BAR_TRACK: Color = Color::RgbLowRes(1, 1, 1);
 
 fn brief(e: &str) -> String {
     let mut s: String = e.chars().filter(|c| *c != '\n').take(160).collect();
@@ -1241,10 +1266,24 @@ mod tests {
                 ]
             }
         });
-        let text = top_stakers(&snap).source().to_string();
+        let styled = top_stakers(&snap);
+        let text = styled.source().to_string();
         assert!(text.contains("* you"), "{text}");
         assert!(text.contains("zk_nd3r"), "{text}");
-        assert!(text.contains('█'), "{text}");
+        assert!(!text.chars().any(|c| ('\u{2580}'..='\u{259F}').contains(&c)), "{text}");
+        // 200 vs 100 against a width of 24: the leader is a solid run of 24, the next row is 12
+        // filled and 12 trough. Both runs are spaces, so the ratio does not depend on the font.
+        let solid_widths: Vec<usize> = styled
+            .spans()
+            .filter(|sp| {
+                !sp.content.is_empty()
+                    && sp.content.chars().all(|c| c == ' ')
+                    && sp.attr.color.front == sp.attr.color.back
+            })
+            .map(|sp| sp.content.chars().count())
+            .collect();
+        assert!(solid_widths.contains(&24), "{solid_widths:?}");
+        assert_eq!(solid_widths.iter().filter(|w| **w == 12).count(), 2, "{solid_widths:?}");
         assert!(!text.contains("zfinv1"), "{text}");
         assert!(!text.contains(mine), "{text}");
         assert!(!text.contains(other), "{text}");
@@ -1318,8 +1357,14 @@ mod tests {
         ]);
         let text = top_stakers(&snap).source().to_string();
         assert!(text.contains("Committee: 2 seats"), "{text}");
-        // Table rows start with the right-aligned rank; the legend line above starts with a block.
-        let row = |pk: &str| text.lines().find(|l| l.starts_with("  ") && l.contains(pk)).unwrap_or("").to_string();
+        // A rank cell is three columns wide (`{rank:>3}`) and followed by two spaces.
+        // The legend is also indented, so a leading-space search would pick it up.
+        let row = |pk: &str| {
+            text.lines()
+                .find(|l| l.len() >= 5 && &l[3..5] == "  " && l[..3].trim().parse::<u32>().is_ok() && l.contains(pk))
+                .unwrap_or("")
+                .to_string()
+        };
         assert!(row("0102").contains("none"), "{text}");
         assert!(row("0304").contains("#1"), "{text}");
         assert!(row("0506").contains("#2"), "{text}");
