@@ -4,11 +4,14 @@
 //! config file. Nothing in the node is changed.
 
 mod config;
+mod finality;
+mod mining;
 mod node;
 mod poll;
 mod render;
 mod rpc;
 mod ui;
+mod upgrade;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -16,12 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--log-file PATH] [--service NAME] [--read-only]
+                     [--miner-address ADDR]
 
   --config PATH    zebrad.toml to manage (default: the -c path in the systemd unit's ExecStart,
                    else zebrad's default location for this OS)
   --rpc URL        node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
   --log-file PATH  read node logs from this file (default on Linux: the unit's journal)
   --service NAME   systemd unit running zebrad, Linux only (default: zebra-crosslink)
+  --miner-address ADDR
+                   payout address whose blocks count as this miner's (default: [mining] miner_address
+                   in the config); set it when watching a remote node whose config is elsewhere
   --read-only      watch only: no staking actions, config edits or start/stop/restart, so it is
                    safe next to scripts that manage the node, or pointed at a remote node
 
@@ -33,6 +40,7 @@ fn main() {
     let mut rpc_arg = None;
     let mut log_file = None;
     let mut read_only = false;
+    let mut miner_address_arg = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -41,6 +49,7 @@ fn main() {
             "--rpc" => rpc_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--log-file" => log_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage_exit()))),
             "--read-only" => read_only = true,
+            "--miner-address" => miner_address_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -72,6 +81,7 @@ fn main() {
         format!("http://{addr}")
     });
     let cache_dir = cfg.get_str(&["state", "cache_dir"]);
+    let miner_address = miner_address_arg.or_else(|| cfg.get_str(&["mining", "miner_address"])).filter(|a| !a.is_empty());
 
     let snap = Arc::new(Mutex::new(poll::Snap::default()));
     let cfg = Arc::new(Mutex::new(cfg));
@@ -105,6 +115,7 @@ fn main() {
             cache_dir: cache_dir.clone(),
             snap: snap.clone(),
             want_logs: want_logs.clone(),
+            miner_address: miner_address.clone(),
         };
         let sink = siv.cb_sink().clone();
         let stop_poller = stop.clone();

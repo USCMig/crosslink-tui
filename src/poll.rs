@@ -1,6 +1,8 @@
 //! Background snapshot of node state. The UI only ever renders the latest snapshot, so a slow or
 //! dead node never blocks key handling.
 
+use crate::finality;
+use crate::mining;
 use crate::node;
 use crate::rpc::Rpc;
 use serde_json::{json, Value};
@@ -14,6 +16,11 @@ const LOG_LINES: usize = 1500;
 /// Public bonded-stake index. The node roster RPC stays empty until the snapshot.
 const ROSTER_URL: &str = "https://ctaz.cash/v14/api/roster";
 const BOARD_EVERY: Duration = Duration::from_secs(45);
+/// Mining health scans blocks and greps a day of logs, so it runs on its own, slower clock.
+const MINING_EVERY: Duration = Duration::from_secs(60);
+/// Block spacing for ETAs, re-measured every `SPACING_EVERY` over this many blocks.
+const SPACING_BLOCKS: u64 = 500;
+const SPACING_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Default, Clone)]
 pub struct Snap {
@@ -35,12 +42,21 @@ pub struct Snap {
     /// Last time the node answered `getinfo`. While `rpc_error` is set, every node-derived field
     /// still holds the values from this moment.
     pub rpc_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Blocks found, submit verdicts and discarded solutions; refreshed every `MINING_EVERY`.
+    pub mining_health: Option<mining::MiningHealth>,
     pub final_tip: Value,
     pub finality: Value,
     pub quorum: Value,
     pub rounds: Value,
     pub bft_stats: Value,
     pub bft_block: Value,
+    /// `get_tfl_recency_status`: BFT position and per-finalizer votes. Ships with the node, so it
+    /// is there even when the diagnostic RPCs are not.
+    pub recency: Value,
+    /// Finality over the time this TUI has been running.
+    pub history: finality::History,
+    /// Mean PoW block spacing over the last `SPACING_BLOCKS` blocks.
+    pub avg_block_secs: Option<f64>,
     pub service: HashMap<String, String>,
     /// A service manager (systemd) runs the node, so start/stop/status apply.
     pub managed: bool,
@@ -69,6 +85,8 @@ pub struct Poller {
     pub cache_dir: Option<String>,
     pub snap: Arc<Mutex<Snap>>,
     pub want_logs: Arc<AtomicBool>,
+    /// Address whose coinbase payouts count as this miner's blocks.
+    pub miner_address: Option<String>,
 }
 
 impl Poller {
@@ -82,6 +100,16 @@ impl Poller {
         let board_busy = Arc::new(AtomicBool::new(false));
         let found: Arc<Mutex<(Option<String>, Option<String>)>> = Arc::default();
         let board_slot: Arc<Mutex<Option<Result<Value, String>>>> = Arc::default();
+        let mut last_mining = None::<Instant>;
+        let mut last_spacing = None::<Instant>;
+        let mining_busy = Arc::new(AtomicBool::new(false));
+        let mining_slot: Arc<Mutex<Option<mining::MiningHealth>>> = Arc::default();
+        // The tracker keeps its block cache between passes, so only new blocks are fetched.
+        let tracker = Arc::new(Mutex::new(mining::Tracker::new(
+            Rpc::new(&self.rpc.url),
+            self.log_source.clone(),
+            self.miner_address.clone(),
+        )));
         while !stop.load(Ordering::Relaxed) {
             let mut s = self.snap.lock().unwrap().clone();
             s.service = node::service_props(&self.service);
@@ -159,7 +187,29 @@ impl Poller {
                 });
             }
 
+            if let Some(h) = mining_slot.lock().unwrap().take() {
+                s.mining_health = Some(h);
+            }
+            if last_mining.is_none_or(|t| t.elapsed() > MINING_EVERY) && !mining_busy.swap(true, Ordering::Relaxed) {
+                last_mining = Some(Instant::now());
+                let (slot, busy, tracker) = (mining_slot.clone(), mining_busy.clone(), tracker.clone());
+                std::thread::spawn(move || {
+                    let h = tracker.lock().unwrap().pass();
+                    *slot.lock().unwrap() = Some(h);
+                    busy.store(false, Ordering::Relaxed);
+                });
+            }
+
             self.fetch_rpc(&mut s);
+            if s.rpc_error.is_none() {
+                record_finality(&mut s);
+                if last_spacing.is_none_or(|t| t.elapsed() > SPACING_EVERY) {
+                    if let Some(secs) = self.block_spacing(&s) {
+                        s.avg_block_secs = Some(secs);
+                        last_spacing = Some(Instant::now());
+                    }
+                }
+            }
             if self.want_logs.load(Ordering::Relaxed) {
                 s.logs = node::log_lines(&self.log_source, LOG_LINES);
             }
@@ -206,6 +256,17 @@ impl Poller {
         s.rounds = self.get(s, "get_tfl_round_diagnosis", json!([]));
         s.bft_stats = self.get(s, "get_tfl_bft_internal_stats", json!([]));
         s.bft_block = self.get(s, "get_tfl_bft_block", json!([]));
+        s.recency = self.get(s, "get_tfl_recency_status", json!([]));
+    }
+
+    /// Seconds per block over the last `SPACING_BLOCKS` blocks, from two header timestamps.
+    fn block_spacing(&self, s: &Snap) -> Option<f64> {
+        let tip = s.chain.get("blocks").and_then(Value::as_u64)?;
+        let tip_time = s.header.get("time").and_then(Value::as_i64)?;
+        let from = tip.checked_sub(SPACING_BLOCKS)?;
+        let hash = self.rpc.call("getblockhash", json!([from])).ok()?;
+        let then = self.rpc.call("getblockheader", json!([hash, true])).ok()?.get("time").and_then(Value::as_i64)?;
+        (tip_time > then).then(|| (tip_time - then) as f64 / SPACING_BLOCKS as f64)
     }
 
     /// Calls `method`, remembering it if this node build does not have it.
@@ -254,6 +315,19 @@ impl Poller {
             "withdrawable_zats": total(s.positions.get("withdrawable")),
         })
     }
+}
+
+/// Adds a finality sample: the BFT height from the diagnostics when present, else from the
+/// recency status every node has.
+fn record_finality(s: &mut Snap) {
+    let bft_height = s
+        .finality
+        .get("bft_height")
+        .and_then(Value::as_u64)
+        .or_else(|| s.recency.get("my_height").and_then(Value::as_u64));
+    let (Some(bft_height), Some(pow_tip)) = (bft_height, s.chain.get("blocks").and_then(Value::as_u64)) else { return };
+    let finalized = s.final_tip.get("height").and_then(Value::as_u64);
+    s.history.push(finality::Sample { t: chrono::Utc::now().timestamp(), bft_height, pow_tip, finalized });
 }
 
 /// True when the public roster document actually lists bonded finalizers.

@@ -57,8 +57,8 @@ fn opt<T: ToString>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
-/// RPCs this TUI uses that the upstream v14 node release does not have. The README explains how to
-/// add them to a node build (node-patches/).
+/// RPCs this TUI uses that the upstream node releases (v14, v15) do not have. The README explains
+/// how to add them to a node build (node-patches/).
 pub const EXTRA_RPCS: [&str; 6] = [
     "get_tfl_finality_status",
     "get_tfl_quorum_status",
@@ -73,7 +73,7 @@ fn lacks(snap: &Snap, rpc: &str) -> bool {
 }
 
 fn lacks_note(rpc: &str) -> String {
-    format!("n/a: this node has no {rpc} RPC (not in the upstream v14 release; see the README)")
+    format!("n/a: this node has no {rpc} RPC (not in the upstream releases; see the README)")
 }
 
 fn line(out: &mut String, label: &str, value: impl AsRef<str>) {
@@ -123,12 +123,22 @@ pub fn basic(snap: &Snap) -> String {
     line(&mut o, "Difficulty", snap.chain.get("difficulty").and_then(Value::as_f64).map(|d| format!("{d:.2}")).unwrap_or("-".into()));
     line(&mut o, "Network Solutions/s", opt(u(&snap.mining, "networksolps")));
     line(&mut o, "Chain Tip Timestamp", i(&snap.header, "time").map(utc).unwrap_or("-".into()));
+    let tip = u(&snap.chain, "blocks").unwrap_or(0);
+    let (up, warn) = crate::upgrade::status_line(&snap.info, &snap.chain, tip, snap.avg_block_secs);
+    let _ = writeln!(o, "{}{:<W2$}{}", if warn { "!" } else { "" }, "Network Upgrade:", up.trim_start_matches("! "), W2 = if warn { W - 1 } else { W });
     o.push_str(RULE);
     o.push('\n');
     let fin_h = u(&snap.final_tip, "height");
     line(&mut o, "BFT Finalized Height", fin_h.map(|h| h.to_string()).unwrap_or("none yet".into()));
     if lacks(snap, "get_tfl_finality_status") {
-        line(&mut o, "BFT Height / Round", lacks_note("get_tfl_finality_status"));
+        // Every node has the recency status, so the position is still known without the diagnostics.
+        line(&mut o, "BFT Height / Round", format!("{} / {}", opt(u(&snap.recency, "my_height")), opt(u(&snap.recency, "my_round"))));
+        let health = match bft_stall_secs(snap) {
+            Some(secs) if secs >= STALL_SECS => format!("no decision seen for {} (see BFT Finality)", age(secs)),
+            Some(_) => "deciding".into(),
+            None => "-".into(),
+        };
+        line(&mut o, "Finality Health", health);
     } else {
         line(&mut o, "BFT Height / Round", format!("{} / {}", opt(u(&snap.finality, "bft_height")), opt(u(&snap.finality, "bft_round"))));
         line(&mut o, "Finality Health", finality_health(&snap.finality));
@@ -216,7 +226,101 @@ pub fn mining_status(snap: &Snap, threads_in_config: Option<i64>, gpu_env: Optio
         line(&mut o, "GPU solver (systemd env)", "configured");
         let _ = writeln!(o, "  {env}");
     }
+    mining_health(&mut o, snap, gpu_env.is_some_and(|e| e.contains("GPU")));
     o
+}
+
+fn count_list(items: &[(String, u64)]) -> String {
+    items.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", ")
+}
+
+fn share(found: u64, of: u64) -> String {
+    if of == 0 { "-".into() } else { format!("{found} of {of} ({:.2}%)", found as f64 * 100.0 / of as f64) }
+}
+
+/// Blocks found (from the chain) and what happened to submitted and discarded solutions (from
+/// the logs). Lines that need attention start with `!`.
+fn mining_health(o: &mut String, snap: &Snap, gpu_configured: bool) {
+    let _ = writeln!(o, "{RULE}");
+    let Some(h) = &snap.mining_health else {
+        let _ = writeln!(o, "Mining health: first scan running (reads about a day of blocks)...");
+        return;
+    };
+    let updated = h.computed_at.map(|t| age((chrono::Utc::now() - t).num_seconds())).unwrap_or("-".into());
+    let _ = writeln!(o, "Mining health (updated {updated} ago; refreshes every minute)");
+    line(o, "Payout address", h.address.as_deref().map(|a| short(a, 40)).unwrap_or("- (none set)".into()));
+
+    match (&h.chain, &h.chain_error) {
+        (Some(c), _) => {
+            let net = u(&snap.mining, "networksolps").unwrap_or(0) as f64;
+            line(o, "Blocks found, last hour", share(c.found_1h, c.blocks_1h));
+            line(o, "Blocks found, last day", share(c.found_24h, c.blocks_24h));
+            if net > 0.0 && c.blocks_24h > 0 {
+                let est = |f: u64, b: u64| if b == 0 { "-".into() } else { format!("~{:.0}", net * f as f64 / b as f64) };
+                line(
+                    o,
+                    "Est. Sol/s from block share",
+                    format!("{} (hour), {} (day); rough with few blocks", est(c.found_1h, c.blocks_1h), est(c.found_24h, c.blocks_24h)),
+                );
+            }
+            let last = match c.last_found {
+                Some((height, t)) => format!("{height}, {} ago", age(chrono::Utc::now().timestamp() - t)),
+                None => "none in the window".into(),
+            };
+            line(o, "Last block found", last);
+            if c.tip >= crate::mining::WINDOW_BLOCKS && c.scanned_from > c.tip + 1 - crate::mining::WINDOW_BLOCKS {
+                let _ = writeln!(o, "  (still reading the last day of blocks: back to {} so far)", c.scanned_from);
+            } else if c.found_24h == 0 && c.blocks_24h > 0 {
+                let _ = writeln!(o, "! No block found in the last day. Check that the miner is running and paying this address.");
+            }
+        }
+        (None, Some(e)) => line(o, "Blocks found", format!("unavailable: {e}")),
+        (None, None) => {}
+    }
+
+    let Some(l) = &h.logs else {
+        if let Some(note) = &h.logs_note {
+            let _ = writeln!(o, "Log-based counters unavailable: {note}.");
+        }
+        return;
+    };
+    let _ = writeln!(o, "From the node's logs:");
+    line(o, "  Submitted, accepted", format!("{} (hour), {} (day)", l.accepted_1h, l.accepted_24h));
+    if l.rejected_24h.is_empty() {
+        line(o, "  Submitted, rejected", "none (day)");
+    } else {
+        let n: u64 = l.rejected_24h.iter().map(|r| r.1).sum();
+        let _ = writeln!(o, "! {:<28}{n} (day): {}", "Submitted, rejected:", count_list(&l.rejected_24h));
+    }
+    if l.submit_errors_24h > 0 {
+        let _ = writeln!(o, "! {:<28}{} (day)", "Submit errors:", l.submit_errors_24h);
+    }
+    if l.orphans.is_empty() {
+        line(o, "  Orphaned after acceptance", "none (day)");
+    } else {
+        let list: Vec<String> = l.orphans.iter().map(|(height, hash)| format!("{height} ({})", short(hash, 12))).collect();
+        let _ = writeln!(o, "! {:<28}{}: {}", "Orphaned after acceptance:", l.orphans.len(), list.join(", "));
+    }
+    let reasons = if l.discarded_reasons.is_empty() { String::new() } else { format!(": {}", count_list(&l.discarded_reasons)) };
+    line(o, "  Discarded before submit", format!("{} (hour), {} (day){reasons}", l.discarded_1h, l.discarded_24h));
+    let _ = writeln!(o, "    The node's own check threw these solutions away; the built-in CPU solver produces a few.");
+    let gpu = match l.gpu_started {
+        Some(true) if l.gpu_fallbacks_1h > 0 => {
+            format!("! running, but fell back to the CPU {} times (hour), {} (day)", l.gpu_fallbacks_1h, l.gpu_fallbacks_24h)
+        }
+        Some(true) if l.gpu_fallbacks_24h > 0 => {
+            format!("running; no fallbacks this hour ({} earlier in the day, e.g. before a restart)", l.gpu_fallbacks_24h)
+        }
+        Some(true) => "running, no fallbacks to the CPU (day)".to_string(),
+        Some(false) => "! failed to start; the node mines on the CPU only".to_string(),
+        None if gpu_configured => "configured, no startup line in the last day".to_string(),
+        None => "not configured".to_string(),
+    };
+    if gpu.starts_with('!') {
+        let _ = writeln!(o, "! {:<28}{}", "GPU solver:", gpu.trim_start_matches("! "));
+    } else {
+        line(o, "  GPU solver", gpu);
+    }
 }
 
 pub fn staking(snap: &Snap) -> String {
@@ -231,6 +335,15 @@ pub fn staking(snap: &Snap) -> String {
     line(&mut o, "Available to stake", zats(Some(avail)));
     line(&mut o, "Staked", zats(u(w, "staked_zats")));
     line(&mut o, "Withdrawable", zats(u(w, "withdrawable_zats")));
+    if crate::upgrade::node_is_v15(&snap.info, &snap.chain) {
+        let _ = writeln!(o, "{RULE}");
+        let _ = writeln!(o, "v15 rules: a new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ...).");
+        let _ = writeln!(o, "Unbonding and withdrawing take any amount. Fill max picks the largest bond that fits.");
+    }
+    let (up, warn) = crate::upgrade::status_line(&snap.info, &snap.chain, h, snap.avg_block_secs);
+    if warn {
+        let _ = writeln!(o, "{up}");
+    }
     o
 }
 
@@ -722,54 +835,119 @@ fn alloc_widths(amounts: &[u64], width: usize) -> Vec<usize> {
     widths
 }
 
+/// How long BFT has gone without deciding, from the diagnostics when present, else from this
+/// TUI's own observations (a lower bound until it has watched for a while).
+pub fn bft_stall_secs(snap: &Snap) -> Option<i64> {
+    if let Some(secs) = i(&snap.finality, "secs_since_last_decision") {
+        return Some(secs);
+    }
+    let now = chrono::Utc::now().timestamp();
+    snap.history.height_since().map(|t| now - t)
+}
+
+/// BFT is considered stalled once it has gone this long without a decision.
+pub const STALL_SECS: i64 = 300;
+
+/// Short BFT state for the header: height, and a warning when it stalls.
+pub fn bft_header(snap: &Snap) -> Option<(String, bool)> {
+    let height = u(&snap.finality, "bft_height").or_else(|| u(&snap.recency, "my_height"))?;
+    if height == 0 {
+        return Some(("BFT not started".into(), false));
+    }
+    match bft_stall_secs(snap) {
+        Some(secs) if secs >= STALL_SECS => Some((format!("BFT STALLED at {height} for {}", age(secs)), true)),
+        _ => Some((format!("BFT {height}"), false)),
+    }
+}
+
 pub fn bft(snap: &Snap) -> String {
     let mut o = String::new();
     let f = &snap.finality;
-    let missing: Vec<&str> = EXTRA_RPCS[..5].iter().copied().filter(|m| lacks(snap, m)).collect();
-    if !missing.is_empty() {
-        let _ = writeln!(
-            o,
-            "This node build lacks {} of the 5 BFT diagnostic RPCs this panel uses. They are not part of\n\
-             the upstream v14 release; the README's \"Adding the extra RPCs to your node\" section shows\n\
-             how to add them.\n{RULE}",
-            missing.len()
-        );
-    }
-    o.push_str("Finality status (get_tfl_finality_status)\n");
-    if lacks(snap, "get_tfl_finality_status") {
-        let _ = writeln!(o, "  {}", lacks_note("get_tfl_finality_status"));
-    } else if f.is_null() {
-        o.push_str("  unavailable\n");
+    let r = &snap.recency;
+    let now = chrono::Utc::now().timestamp();
+    let diag = !lacks(snap, "get_tfl_finality_status") && !f.is_null();
+
+    // Summary: from the diagnostics when the node has them, otherwise from RPCs every node has.
+    o.push_str("Summary\n");
+    let height = u(f, "bft_height").or_else(|| u(r, "my_height"));
+    let round = u(f, "bft_round").or_else(|| u(r, "my_round"));
+    let step = f.get("bft_step").and_then(Value::as_str).map(String::from).or_else(|| u(r, "my_step").map(|x| crate::finality::step_name(x).to_string()));
+    let health = if diag {
+        if f.get("healthy").and_then(Value::as_bool) == Some(true) { "healthy".to_string() } else { "NOT healthy".to_string() }
     } else {
-        line(&mut o, "  Health", if f.get("healthy").and_then(Value::as_bool) == Some(true) { "healthy" } else { "NOT healthy" });
-        line(&mut o, "  BFT height / round / step", format!("{} / {} / {}", opt(u(f, "bft_height")), opt(u(f, "bft_round")), s(f, "bft_step")));
-        line(&mut o, "  Locked / valid round", format!("{} / {}", opt(u(f, "bft_locked_round")), opt(u(f, "bft_valid_round"))));
-        line(&mut o, "  BFT chain length", opt(u(f, "bft_chain_len")));
-        line(&mut o, "  PoW tip / finalized", format!("{} / {}", opt(u(f, "pow_tip_height")), opt(u(f, "finalized_height"))));
-        line(&mut o, "  Finality gap", opt(u(f, "finality_gap")));
-        line(&mut o, "  Since last decision", i(f, "secs_since_last_decision").map(age).unwrap_or("-".into()));
-        line(&mut o, "  Roster size", opt(u(f, "roster_n")));
+        match bft_stall_secs(snap) {
+            Some(secs) if secs >= STALL_SECS => format!("NOT healthy: no decision seen for {}", age(secs)),
+            Some(_) => "deciding".to_string(),
+            None => "-".to_string(),
+        }
+    };
+    line(&mut o, "  Health", health);
+    line(&mut o, "  BFT height / round / step", format!("{} / {} / {}", opt(height), opt(round), step.as_deref().unwrap_or("-")));
+    let since = i(f, "secs_since_last_decision").or_else(|| snap.history.last_decision_seen().map(|t| now - t));
+    line(&mut o, "  Since last decision", since.map(age).unwrap_or("- (none seen yet)".into()));
+    let tip = u(&snap.chain, "blocks");
+    let fin = u(&snap.final_tip, "height");
+    line(&mut o, "  PoW tip / finalized", format!("{} / {}", opt(tip), fin.map(|h| h.to_string()).unwrap_or("none yet".into())));
+    if let (Some(t), Some(fh)) = (tip, fin) {
+        line(&mut o, "  Finality gap", format!("{} blocks", t.saturating_sub(fh)));
+    }
+    if diag {
+        line(&mut o, "  Locked / valid round", format!("{} / {}", opt(i(f, "bft_locked_round")), opt(i(f, "bft_valid_round"))));
         line(&mut o, "  Online power", format!("{} of {} ({:.1}%)", zats(u(f, "online_power")), zats(u(f, "total_power")), f.get("online_power_pct").and_then(Value::as_f64).unwrap_or(0.0)));
         line(&mut o, "  Quorum threshold", format!("{} (online: {})", zats(u(f, "quorum_threshold")), if f.get("quorum_online").and_then(Value::as_bool) == Some(true) { "yes" } else { "no" }));
         for d in f.get("diagnosis").and_then(Value::as_array).into_iter().flatten() {
             let _ = writeln!(o, "  ! {}", d.as_str().unwrap_or(""));
         }
-    }
-    o.push_str(RULE);
-    o.push_str("\nQuorum (get_tfl_quorum_status)\n");
-    let q = snap.quorum.as_array().cloned().unwrap_or_default();
-    if lacks(snap, "get_tfl_quorum_status") {
-        let _ = writeln!(o, "  {}", lacks_note("get_tfl_quorum_status"));
-    } else if q.is_empty() {
-        o.push_str("  no active roster\n");
     } else {
-        let _ = writeln!(o, "  {:<14} {:>16} {:>7} {:<7} {:>6} {:<5} {:<5}", "Finalizer", "Power", "Share", "Online", "Seen", "Prev", "Prec");
+        let _ = writeln!(o, "  (from get_tfl_recency_status; the diagnostic RPCs add health checks, see below)");
+    }
+
+    // Trend, from what this TUI has watched.
+    o.push_str(RULE);
+    o.push_str("\nFinality trend (watched since this TUI started)\n");
+    let h = &snap.history;
+    if h.is_empty() {
+        o.push_str("  collecting...\n");
+    } else {
+        let span = h.span(now);
+        line(&mut o, "  Watching for", age(span));
+        let rate = |secs: i64| {
+            let n = h.decided_in(now, secs);
+            if span < secs / 2 { format!("{n} (only {} watched)", age(span)) } else { n.to_string() }
+        };
+        line(&mut o, "  Decided, last 10 min", rate(600));
+        line(&mut o, "  Decided, last hour", rate(3_600));
+        let n_hour = h.decided_in(now, 3_600);
+        if n_hour > 0 {
+            line(&mut o, "  Mean time per decision", age(span.min(3_600) / n_hour as i64));
+        }
+        if let Some(gap_now) = h.gap_at(now, 0) {
+            let then = h.gap_at(now, 3_600.min(span));
+            let trend = match then {
+                Some(g) if gap_now > g + 10 => format!("{gap_now} blocks, up from {g} (falling behind)"),
+                Some(g) if g > gap_now + 10 => format!("{gap_now} blocks, down from {g} (catching up)"),
+                Some(g) => format!("{gap_now} blocks (was {g})"),
+                None => format!("{gap_now} blocks"),
+            };
+            line(&mut o, "  Finality gap", trend);
+        }
+        if let Some((spark, max)) = h.gap_sparkline(now, 3_600.min(span.max(60)), 40) {
+            let _ = writeln!(o, "  Gap, last {:<5} [{spark}] max {max}", age(3_600.min(span.max(60))));
+        }
+    }
+
+    // Who is voting.
+    o.push_str(RULE);
+    let q = snap.quorum.as_array().cloned().unwrap_or_default();
+    if !lacks(snap, "get_tfl_quorum_status") && !q.is_empty() {
+        o.push_str("\nQuorum (get_tfl_quorum_status)\n");
+        let _ = writeln!(o, "  {:<14} {:>20} {:>7} {:<7} {:>6} {:<5} {:<5}", "Finalizer", "Power", "Share", "Online", "Seen", "Prev", "Prec");
         for m in &q {
             let me = if m.get("is_me").and_then(Value::as_bool) == Some(true) { "*" } else { " " };
             let yn = |k: &str| if m.get(k).and_then(Value::as_bool) == Some(true) { "yes" } else { "no" };
             let _ = writeln!(
                 o,
-                " {me}{:<14} {:>16} {:>6.2}% {:<7} {:>6} {:<5} {:<5}",
+                " {me}{:<14} {:>20} {:>6.2}% {:<7} {:>6} {:<5} {:<5}",
                 short(s(m, "pub_key"), 10),
                 zats(u(m, "voting_power")),
                 m.get("power_pct").and_then(Value::as_f64).unwrap_or(0.0),
@@ -779,7 +957,10 @@ pub fn bft(snap: &Snap) -> String {
                 yn("precommitted"),
             );
         }
+    } else {
+        recency_quorum(&mut o, snap, now);
     }
+
     o.push_str(RULE);
     o.push_str("\nRounds at current height (get_tfl_round_diagnosis)\n");
     let rounds = snap.rounds.as_array().cloned().unwrap_or_default();
@@ -814,18 +995,90 @@ pub fn bft(snap: &Snap) -> String {
         line(&mut o, "  BFT blocks / index", format!("{} / {}", opt(u(st, "bft_blocks_len")), opt(u(st, "bft_block_index_len"))));
         line(&mut o, "  BFT peers", st.get("peers").and_then(Value::as_array).map_or("-".into(), |p| p.len().to_string()));
     }
-    o.push_str(RULE);
-    o.push_str("\nBFT tip block (get_tfl_bft_block)\n");
-    let b = &snap.bft_block;
-    if lacks(snap, "get_tfl_bft_block") {
-        let _ = writeln!(o, "  {}", lacks_note("get_tfl_bft_block"));
-    } else if b.is_null() {
-        o.push_str("  none yet\n");
-    } else {
-        line(&mut o, "  Height", opt(u(b, "height")));
-        line(&mut o, "  Hash", short(s(b, "hash"), 24));
-        line(&mut o, "  Finalizes PoW block", short(s(b, "candidate_hash"), 24));
-        line(&mut o, "  Headers / signatures", format!("{} / {}", opt(u(b, "header_count")), opt(u(b, "signature_count"))));
+    o
+}
+
+/// Per-finalizer votes at the node's BFT height from `get_tfl_recency_status`, with voting power
+/// from the roster. Used when the node has no `get_tfl_quorum_status`.
+fn recency_quorum(o: &mut String, snap: &Snap, now: i64) {
+    o.push_str("\nVotes at this BFT height (get_tfl_recency_status)\n");
+    let rows = crate::finality::recent_finalizers(&snap.recency);
+    if rows.is_empty() {
+        o.push_str("  no finalizers reported (BFT not running yet, or the node is too old for this RPC)\n");
+        return;
+    }
+    let power: std::collections::HashMap<String, u64> = snap
+        .roster
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| Some((m.get("pub_key")?.as_str()?.to_ascii_lowercase(), m.get("voting_power")?.as_u64()?)))
+        // The roster RPC prints keys in raw byte order; the recency status prints them reversed.
+        .flat_map(|(k, p)| [(reverse_hex(&k), p), (k, p)])
+        .collect();
+    let total: u64 = snap.roster.as_array().into_iter().flatten().filter_map(|m| m.get("voting_power")?.as_u64()).sum();
+    let _ = writeln!(o, "  {:<14} {:>7} {:>6} {:>9} {:>9} {:>5}", "Finalizer", "Share", "Seen", "Prevotes", "Precommit", "Round");
+    let (mut yes_pre, mut yes_com) = (0u64, 0u64);
+    for f in &rows {
+        let p = power.get(&f.pub_key.to_ascii_lowercase()).copied();
+        if f.prevotes.1 > 0 {
+            yes_pre += p.unwrap_or(0);
+        }
+        if f.precommits.1 > 0 {
+            yes_com += p.unwrap_or(0);
+        }
+        let share = match p {
+            Some(p) if total > 0 => format!("{:.2}%", p as f64 * 100.0 / total as f64),
+            _ => "-".into(),
+        };
+        let _ = writeln!(
+            o,
+            "  {:<14} {:>7} {:>6} {:>4}y/{:<3}n {:>4}y/{:<3}n {:>5}",
+            short(&f.pub_key, 10),
+            share,
+            f.last_direct_utc.map(|t| age(now - t)).unwrap_or("-".into()),
+            f.prevotes.1,
+            f.prevotes.0,
+            f.precommits.1,
+            f.precommits.0,
+            f.highest_round,
+        );
+    }
+    if total > 0 {
+        let need = crate::finality::quorum_threshold(total);
+        line(o, "  Yes prevote power", format!("{:.1}% (a decision needs {:.1}%)", yes_pre as f64 * 100.0 / total as f64, need as f64 * 100.0 / total as f64));
+        line(o, "  Yes precommit power", format!("{:.1}%", yes_com as f64 * 100.0 / total as f64));
+    }
+    let _ = writeln!(o, "  Seen = last direct packet from that finalizer. Votes are counted as votes, not by power.");
+}
+
+/// The same bytes in the opposite order, as hex.
+fn reverse_hex(h: &str) -> String {
+    let bytes: Vec<&str> = (0..h.len() / 2).map(|i| &h[2 * i..2 * i + 2]).collect();
+    bytes.into_iter().rev().collect()
+}
+
+/// One BFT block for the block browser (`get_tfl_bft_block`).
+pub fn bft_block_text(b: &Value, tip: Option<u64>) -> String {
+    if b.is_null() {
+        return "No block at that height.".into();
+    }
+    let mut o = String::new();
+    let h = u(b, "height");
+    let pos = match (h, tip) {
+        (Some(h), Some(t)) if h == t => " (tip)".to_string(),
+        (Some(h), Some(t)) if t > h => format!(" ({} behind the tip)", t - h),
+        _ => String::new(),
+    };
+    line(&mut o, "Height", format!("{}{pos}", opt(h)));
+    line(&mut o, "Hash", s(b, "hash"));
+    line(&mut o, "Finalizes PoW block", s(b, "candidate_hash"));
+    line(&mut o, "Version", opt(u(b, "version")));
+    line(&mut o, "Headers / signatures", format!("{} / {}", opt(u(b, "header_count")), opt(u(b, "signature_count"))));
+    line(&mut o, "Hardforks carried", opt(u(b, "hardfork_count")));
+    let dnib = u(b, "do_not_include_until_bc_height").unwrap_or(0);
+    if dnib > 0 {
+        line(&mut o, "Not includable before PoW", dnib.to_string());
     }
     o
 }
@@ -868,6 +1121,14 @@ pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[Stri
     line(&mut o, "zebrad build", s(&snap.info, "build"));
     line(&mut o, "zebrad subversion", s(&snap.info, "subversion"));
     line(&mut o, "Protocol version", opt(u(&snap.info, "protocolversion")));
+    let tip = u(&snap.chain, "blocks").unwrap_or(0);
+    let (up, _) = crate::upgrade::status_line(&snap.info, &snap.chain, tip, snap.avg_block_secs);
+    line(&mut o, "Network upgrade", up);
+    line(
+        &mut o,
+        "Staking RPC",
+        if crate::upgrade::node_is_v15(&snap.info, &snap.chain) { "wallet_staking_action" } else { "staking_command (pre-v15 node)" },
+    );
     line(&mut o, "Chain", s(&snap.chain, "chain"));
     line(&mut o, "Service", service);
     line(&mut o, "Binary", argv.first().cloned().unwrap_or("-".into()));
@@ -880,7 +1141,7 @@ pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[Stri
     let missing: Vec<&str> = EXTRA_RPCS.iter().copied().filter(|m| lacks(snap, m)).collect();
     line(
         &mut o,
-        "Extra RPCs (not in v14)",
+        "Extra RPCs (not upstream)",
         if snap.rpc_error.is_some() {
             "unknown (RPC unreachable)".to_string()
         } else if missing.is_empty() {

@@ -109,7 +109,7 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 /// The last `max_bytes` of a file, split into lines (the first, possibly partial, line dropped).
-fn file_tail(path: &Path, max_bytes: u64) -> Vec<String> {
+pub fn file_tail(path: &Path, max_bytes: u64) -> Vec<String> {
     let Ok(mut f) = std::fs::File::open(path) else { return vec![format!("cannot open {}", path.display())] };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(max_bytes);

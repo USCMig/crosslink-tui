@@ -43,6 +43,8 @@ pub struct App {
     pub read_only: bool,
     last_roster: Vec<String>,
     last_bonds: Vec<String>,
+    /// BFT block browser position: None follows the tip.
+    bft_view: Option<u64>,
 }
 
 impl App {
@@ -61,7 +63,7 @@ impl App {
     ) -> Self {
         Self {
             snap, cfg, rpc, service, argv, log_desc, pending, want_logs, panel,
-            log_filter: 0, hide_noise: true, read_only, last_roster: Vec::new(), last_bonds: Vec::new(),
+            log_filter: 0, hide_noise: true, read_only, last_roster: Vec::new(), last_bonds: Vec::new(), bft_view: None,
         }
     }
 }
@@ -170,7 +172,7 @@ pub fn build(siv: &mut Cursive, app_state: App) {
         stack.add_fullscreen_layer(Layer::new(logs_panel().full_screen()).with_name("logs_panel"));
         stack.add_fullscreen_layer(Layer::new(control_panel(ro).full_screen()).with_name("control_panel"));
         stack.add_fullscreen_layer(Layer::new(config_panel(ro).full_screen()).with_name("config_panel"));
-        stack.add_fullscreen_layer(Layer::new(text_panel("bft_text").full_screen()).with_name("bft_panel"));
+        stack.add_fullscreen_layer(Layer::new(bft_panel().full_screen()).with_name("bft_panel"));
         stack.add_fullscreen_layer(Layer::new(text_panel("stakers_text").full_screen()).with_name("stakers_panel"));
         stack.add_fullscreen_layer(Layer::new(staking_panel(ro).full_screen()).with_name("staking_panel"));
         stack.add_fullscreen_layer(Layer::new(mining_panel(&cfg, ro).full_screen()).with_name("mining_panel"));
@@ -258,7 +260,19 @@ pub fn refresh(s: &mut Cursive) {
 
     let build = snap.info.get("build").and_then(Value::as_str).unwrap_or("?").to_string();
     let mut header = StyledString::styled(format!("Crosslink Node {build} [Crosslink Feature Net]"), ColorStyle::title_primary());
-    header.append_plain(format!("    {}    RPC {rpc_url}", render::status_word(&snap)));
+    header.append_plain(format!("    {}", render::status_word(&snap)));
+    if let Some((bft, warn)) = render::bft_header(&snap) {
+        if warn {
+            header.append_styled(format!("    {bft}"), ColorStyle::title_secondary());
+        } else {
+            header.append_plain(format!("    {bft}"));
+        }
+    }
+    header.append_plain(format!("    RPC {rpc_url}"));
+    let tip = snap.chain.get("blocks").and_then(Value::as_u64).unwrap_or(0);
+    if snap.rpc_error.is_none() && crate::upgrade::status_line(&snap.info, &snap.chain, tip, None).1 {
+        header.append_styled("    UPGRADE NODE TO v15", ColorStyle::title_secondary());
+    }
     if dirty {
         header.append_styled("    config: unsaved changes", ColorStyle::title_secondary());
     }
@@ -284,7 +298,18 @@ pub fn refresh(s: &mut Cursive) {
             refresh_bonds(s, &snap);
         }
         "stakers" => set_text(s, "stakers_text", render::top_stakers(&snap)),
-        "bft" => set_text(s, "bft_text", render::with_stale_note(&snap, render::bft(&snap))),
+        "bft" => {
+            set_text(s, "bft_text", render::with_stale_note(&snap, render::bft(&snap)));
+            if app(s).bft_view.is_none() {
+                let text = if snap.missing_rpcs.contains("get_tfl_bft_block") {
+                    "n/a: this node has no get_tfl_bft_block RPC (not in the upstream releases; see the README)".to_string()
+                } else {
+                    let tip = snap.bft_block.get("height").and_then(Value::as_u64);
+                    render::bft_block_text(&snap.bft_block, tip)
+                };
+                set_text(s, "bft_block_text", text);
+            }
+        }
         "config" => set_text(s, "config_status", config_status(&config_path, dirty)),
         "control" => set_text(s, "control_text", render::node_control(&snap, &service)),
         "logs" => set_text(s, "logs_text", render::logs(&snap, filter, hide)),
@@ -533,8 +558,15 @@ fn available_zats(snap: &Snap) -> u64 {
 }
 
 fn fill_max_amount(s: &mut Cursive) {
-    let avail = available_zats(&app(s).snap.lock().unwrap());
-    let amount = avail.saturating_sub(STAKE_FEE_BUFFER_ZATS);
+    let (avail, v15) = {
+        let snap = app(s).snap.lock().unwrap();
+        (available_zats(&snap), crate::upgrade::node_is_v15(&snap.info, &snap.chain))
+    };
+    let mut amount = avail.saturating_sub(STAKE_FEE_BUFFER_ZATS);
+    if v15 && amount > 0 {
+        // v15 bonds must be a power of 10 zats: the largest one that fits.
+        amount = crate::upgrade::nearest_powers_of_10(amount).0;
+    }
     let text = format!("{}.{:08}", amount / 100_000_000, amount % 100_000_000);
     s.call_on_name("stake_amount", |e: &mut EditView| e.set_content(text));
 }
@@ -575,7 +607,33 @@ fn stake(s: &mut Cursive, target: Option<String>) {
         Ok(z) => z,
         Err(e) => return info(s, "Stake", e),
     };
-    let avail = available_zats(&app(s).snap.lock().unwrap());
+    let (avail, v15) = {
+        let snap = app(s).snap.lock().unwrap();
+        (available_zats(&snap), crate::upgrade::node_is_v15(&snap.info, &snap.chain))
+    };
+    if v15 && !crate::upgrade::is_power_of_10(amount) {
+        let (lo, hi) = crate::upgrade::nearest_powers_of_10(amount);
+        let set = |text: String| move |s: &mut Cursive| {
+            s.pop_layer();
+            let text = text.clone();
+            s.call_on_name("stake_amount", |e: &mut EditView| e.set_content(text));
+        };
+        let fmt = |z: u64| format!("{}.{:08}", z / 100_000_000, z % 100_000_000).trim_end_matches('0').trim_end_matches('.').to_string();
+        let mut d = Dialog::text(format!(
+            "From v15 a new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ and so on).\n\
+             {} is not. The nearest are {} and {}.",
+            render::zats(Some(amount)),
+            render::zats(Some(lo)),
+            render::zats(Some(hi)),
+        ))
+        .title("Bond amount");
+        d.add_button(format!("Use {}", render::zats(Some(lo))), set(fmt(lo)));
+        if hi <= avail && hi != lo {
+            d.add_button(format!("Use {}", render::zats(Some(hi))), set(fmt(hi)));
+        }
+        s.add_layer(d.dismiss_button("Cancel"));
+        return;
+    }
     if amount > avail {
         return info(s, "Stake", format!("Only {} is available.", render::zats(Some(avail))));
     }
@@ -647,7 +705,7 @@ fn raw_action(s: &mut Cursive) {
                 .child(DummyView)
                 .child(TextArea::new().content(first).with_name("raw_json").min_size((70, 8))),
         )
-        .title("Staking action (sent to staking_command)")
+        .title("Staking action (wallet_staking_action; staking_command on pre-v15 nodes)")
         .button("Submit", |s| {
             let text = s.call_on_name("raw_json", |t: &mut TextArea| t.get_content().to_string()).unwrap_or_default();
             match serde_json::from_str::<Value>(&text) {
@@ -681,6 +739,10 @@ fn submit_staking(s: &mut Cursive, action: Value) {
         return;
     }
     let rpc = app(s).rpc.clone();
+    let v15 = {
+        let snap = app(s).snap.lock().unwrap();
+        crate::upgrade::node_is_v15(&snap.info, &snap.chain)
+    };
     let sink = s.cb_sink().clone();
     s.add_layer(
         Dialog::text("Building the transaction in the node wallet.\nThis can take a few minutes.")
@@ -688,15 +750,113 @@ fn submit_staking(s: &mut Cursive, action: Value) {
             .with_name("busy"),
     );
     std::thread::spawn(move || {
-        // The RPC returns once the wallet has built (and queued) the transaction.
-        let res = rpc.call_with_timeout("staking_command", json!([action.to_string()]), Duration::from_secs(600));
+        // The RPC returns once the wallet has built (and queued) the transaction. v15 replaced
+        // staking_command (a JSON string) with wallet_staking_action (the object itself); try the
+        // one this node should have first, and the other if it turns out not to have it.
+        let call = |method: &str| {
+            let params = if method == "wallet_staking_action" { json!([action.clone()]) } else { json!([action.to_string()]) };
+            rpc.call_with_timeout(method, params, Duration::from_secs(600))
+        };
+        let (first, second) = if v15 { ("wallet_staking_action", "staking_command") } else { ("staking_command", "wallet_staking_action") };
+        let res = match call(first) {
+            Err(e) if e.contains("Method not found") => call(second),
+            other => other,
+        };
         let _ = sink.send(Box::new(move |s: &mut Cursive| {
             if s.find_name::<Dialog>("busy").is_some() {
                 s.pop_layer();
             }
             match res {
-                Ok(_) => info(s, "Staking action sent", "The node accepted the action. Watch Staked / My bonds update once it is mined."),
+                Ok(r) => info(
+                    s,
+                    "Staking action sent",
+                    format!("The node accepted the action. Watch Staked / My bonds update once it is mined.\n\n{}", render::short(&r.to_string(), 300)),
+                ),
                 Err(e) => info(s, "Staking action failed", e),
+            }
+        }));
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// BFT finality
+
+fn bft_panel() -> impl View {
+    LinearLayout::vertical()
+        .child(heading("BFT block browser (get_tfl_bft_block)"))
+        .child(TextView::new("Loading...").with_name("bft_block_text"))
+        .child(
+            LinearLayout::horizontal()
+                .child(Button::new("Older", |s| browse_bft(s, -1)))
+                .child(DummyView)
+                .child(Button::new("Newer", |s| browse_bft(s, 1)))
+                .child(DummyView)
+                .child(Button::new("Tip", |s| {
+                    app(s).bft_view = None;
+                    refresh(s);
+                }))
+                .child(DummyView)
+                .child(Button::new("Go to height...", |s| {
+                    s.add_layer(
+                        Dialog::around(EditView::new().on_submit(|s, text| go_to_bft(s, text)).with_name("bft_goto").fixed_width(12))
+                            .title("BFT height")
+                            .button("Go", |s| {
+                                let text = edit_content(s, "bft_goto");
+                                go_to_bft(s, &text);
+                            })
+                            .dismiss_button("Cancel"),
+                    );
+                })),
+        )
+        .child(DummyView)
+        .child(ScrollView::new(TextView::new("Loading...").with_name("bft_text")).full_height())
+}
+
+fn go_to_bft(s: &mut Cursive, text: &str) {
+    s.pop_layer();
+    match text.trim().parse::<u64>() {
+        Ok(h) => show_bft_block(s, h),
+        Err(_) => info(s, "BFT height", format!("`{}` is not a height.", text.trim())),
+    }
+}
+
+fn bft_tip(s: &mut Cursive) -> Option<u64> {
+    app(s).snap.lock().unwrap().bft_block.get("height").and_then(Value::as_u64)
+}
+
+fn browse_bft(s: &mut Cursive, step: i64) {
+    let Some(tip) = bft_tip(s) else {
+        return info(s, "BFT blocks", "No BFT block yet (or this node has no get_tfl_bft_block RPC).");
+    };
+    let current = app(s).bft_view.unwrap_or(tip);
+    let next = current.saturating_add_signed(step).min(tip);
+    if next >= tip {
+        app(s).bft_view = None;
+        refresh(s);
+    } else {
+        show_bft_block(s, next);
+    }
+}
+
+fn show_bft_block(s: &mut Cursive, height: u64) {
+    let tip = bft_tip(s);
+    if tip.is_some_and(|t| height >= t) {
+        app(s).bft_view = None;
+        return refresh(s);
+    }
+    app(s).bft_view = Some(height);
+    set_text(s, "bft_block_text", format!("Loading BFT block {height}..."));
+    let rpc = app(s).rpc.clone();
+    let sink = s.cb_sink().clone();
+    std::thread::spawn(move || {
+        let text = match rpc.call("get_tfl_bft_block", json!([height])) {
+            Ok(v) => render::bft_block_text(&v, tip),
+            Err(e) => format!("Could not read BFT block {height}: {e}"),
+        };
+        let _ = sink.send(Box::new(move |s: &mut Cursive| {
+            // Only if the user has not moved on to another block meanwhile.
+            if app(s).bft_view == Some(height) {
+                set_text(s, "bft_block_text", text);
             }
         }));
     });
