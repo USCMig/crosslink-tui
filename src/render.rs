@@ -127,6 +127,9 @@ pub fn basic(snap: &Snap) -> String {
     let tip = u(&snap.chain, "blocks").unwrap_or(0);
     let (up, warn) = crate::upgrade::status_line(&snap.info, &snap.chain, tip, snap.avg_block_secs);
     let _ = writeln!(o, "{}{:<W2$}{}", if warn { "!" } else { "" }, "Network Upgrade:", up.trim_start_matches("! "), W2 = if warn { W - 1 } else { W });
+    if let Some((eos, warn)) = crate::upgrade::end_of_support(&snap.deprecation, tip, snap.avg_block_secs) {
+        let _ = writeln!(o, "{}{:<W2$}{}", if warn { "!" } else { "" }, "Node Stops At:", eos.trim_start_matches("! "), W2 = if warn { W - 1 } else { W });
+    }
     o.push_str(RULE);
     o.push('\n');
     let fin_h = u(&snap.final_tip, "height");
@@ -338,12 +341,15 @@ pub fn staking(snap: &Snap) -> String {
     line(&mut o, "Withdrawable", zats(u(w, "withdrawable_zats")));
     if crate::upgrade::node_is_v15(&snap.info, &snap.chain) {
         let _ = writeln!(o, "{RULE}");
-        let _ = writeln!(o, "v15 rules: a new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ...).");
+        let _ = writeln!(o, "Bond rule (since v15): a new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ...).");
         let _ = writeln!(o, "Unbonding and withdrawing take any amount. Fill max picks the largest bond that fits.");
     }
     let (up, warn) = crate::upgrade::status_line(&snap.info, &snap.chain, h, snap.avg_block_secs);
     if warn {
         let _ = writeln!(o, "{up}");
+    }
+    if let Some((eos, true)) = crate::upgrade::end_of_support(&snap.deprecation, h, snap.avg_block_secs) {
+        let _ = writeln!(o, "! this node release stops at {}: upgrade the node software", eos.trim_start_matches("! "));
     }
     o
 }
@@ -1071,7 +1077,8 @@ fn recency_quorum(o: &mut String, snap: &Snap, now: i64) {
         );
     }
     if total > 0 {
-        let need = crate::finality::quorum_threshold(total);
+        let strict = crate::upgrade::strict_quorum(&snap.chain, u(&snap.final_tip, "height"));
+        let need = crate::finality::quorum_threshold(total, strict);
         line(o, "  Yes prevote power", format!("{:.1}% (a decision needs {:.1}%)", yes_pre as f64 * 100.0 / total as f64, need as f64 * 100.0 / total as f64));
         line(o, "  Yes precommit power", format!("{:.1}%", yes_com as f64 * 100.0 / total as f64));
     }
@@ -1151,6 +1158,11 @@ pub fn version(snap: &Snap, service: &str, config: &str, rpc: &str, argv: &[Stri
     let tip = u(&snap.chain, "blocks").unwrap_or(0);
     let (up, _) = crate::upgrade::status_line(&snap.info, &snap.chain, tip, snap.avg_block_secs);
     line(&mut o, "Network upgrade", up);
+    line(
+        &mut o,
+        "End of support",
+        crate::upgrade::end_of_support(&snap.deprecation, tip, snap.avg_block_secs).map_or("-".into(), |(eos, _)| eos),
+    );
     line(
         &mut o,
         "Staking RPC",

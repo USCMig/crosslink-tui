@@ -154,14 +154,21 @@ pub fn step_name(step: u64) -> &'static str {
     }
 }
 
-/// Tenderlink's quorum: with `f = (n - 1) / 3` over total power `n`, a decision needs `2f + 1`
-/// (or all of `n` when `f` is 0). Matches what the node computes, so the numbers agree.
-pub fn quorum_threshold(total: u64) -> u64 {
+/// Tenderlink's quorum over total power `n`, as `tenderlink::decision_threshold` computes it. With
+/// `f = (n - 1) / 3`, a decision needs `2f + 1`, or from FeaturenetUpgrade2 (`strict`) the least
+/// power above two thirds, `floor(2n/3) + 1`. All of `n` when `f` is 0.
+pub fn quorum_threshold(total: u64, strict: bool) -> u64 {
     if total == 0 {
         return 0;
     }
     let f = (total - 1) / 3;
-    if f == 0 { total } else { 2 * f + 1 }
+    if f == 0 {
+        total
+    } else if strict {
+        total / 3 * 2 + total % 3 * 2 / 3 + 1
+    } else {
+        2 * f + 1
+    }
 }
 
 #[cfg(test)]
@@ -208,9 +215,17 @@ mod tests {
 
     #[test]
     fn quorum_matches_tenderlink() {
-        assert_eq!(quorum_threshold(0), 0);
-        assert_eq!(quorum_threshold(3), 3);
-        assert_eq!(quorum_threshold(4), 3);
-        assert_eq!(quorum_threshold(12), 7);
+        assert_eq!(quorum_threshold(0, false), 0);
+        assert_eq!(quorum_threshold(3, false), 3);
+        assert_eq!(quorum_threshold(4, false), 3);
+        assert_eq!(quorum_threshold(12, false), 7);
+        // 2f+1 sits at or below two thirds for n = 3f+2 and 3f+3; the strict quorum never does.
+        assert_eq!(quorum_threshold(3, true), 3);
+        assert_eq!(quorum_threshold(4, true), 3);
+        assert_eq!(quorum_threshold(12, true), 9);
+        for n in 4..500u64 {
+            let q = quorum_threshold(n, true);
+            assert!(3 * q > 2 * n && 3 * (q - 1) <= 2 * n, "{n}");
+        }
     }
 }

@@ -45,6 +45,8 @@ pub struct Snap {
     /// Blocks found, submit verdicts and discarded solutions; refreshed every `MINING_EVERY`.
     pub mining_health: Option<mining::MiningHealth>,
     pub final_tip: Value,
+    /// `getdeprecationinfo`: the height at which this node release stops running.
+    pub deprecation: Value,
     pub finality: Value,
     pub quorum: Value,
     pub rounds: Value,
@@ -100,7 +102,7 @@ impl Poller {
         let mut last_pid = String::new();
         let lookup_busy = Arc::new(AtomicBool::new(false));
         let board_busy = Arc::new(AtomicBool::new(false));
-        let found: Arc<Mutex<(Option<String>, Option<String>, Option<String>)>> = Arc::default();
+        let found: Arc<Mutex<node::StartupFacts>> = Arc::default();
         let board_slot: Arc<Mutex<Option<Result<Value, String>>>> = Arc::default();
         let mut last_mining = None::<Instant>;
         let mut last_spacing = None::<Instant>;
@@ -108,7 +110,7 @@ impl Poller {
         let mining_slot: Arc<Mutex<Option<mining::MiningHealth>>> = Arc::default();
         // The tracker keeps its block cache between passes, so only new blocks are fetched.
         let tracker = Arc::new(Mutex::new(mining::Tracker::new(
-            Rpc::new(&self.rpc.url),
+            self.rpc.clone(),
             self.log_source.clone(),
             self.miner_address.clone(),
         )));
@@ -123,11 +125,11 @@ impl Poller {
                 }
                 last_disk = Some(Instant::now());
             }
-            // Both are logged once at startup and a journal search takes seconds, so look them up
+            // These are logged once at startup and reading the journal takes a while, so look them up
             // off the poll loop, and only when the node process changes (or, while missing, once a
             // minute).
             let pid = s.service.get("MainPID").cloned().unwrap_or_default();
-            let missing = s.finalizer_address.is_none() || s.solvers.is_none();
+            let missing = s.finalizer_address.is_none() || s.solvers.is_none() || s.node_commit.is_none();
             let due = pid != last_pid || (missing && last_lookup.is_none_or(|t| t.elapsed() > Duration::from_secs(60)));
             if pid != last_pid {
                 // A restart may be a different build, so probe every RPC again.
@@ -137,20 +139,21 @@ impl Poller {
                 last_pid = pid;
                 last_lookup = Some(Instant::now());
                 let (src, found, busy) = (self.log_source.clone(), found.clone(), lookup_busy.clone());
+                let started = s.service.get("ExecMainStartTimestamp").cloned();
                 std::thread::spawn(move || {
-                    let r = (node::finalizer_address(&src), node::running_solvers(&src), node::git_commit(&src));
+                    let r = node::startup_facts(&src, started.as_deref());
                     *found.lock().unwrap() = r;
                     busy.store(false, Ordering::Relaxed);
                 });
             }
             {
-                let (addr, solvers, commit) = &*found.lock().unwrap();
-                if addr.is_some() {
-                    s.finalizer_address = addr.clone();
+                let f = found.lock().unwrap();
+                if f.finalizer_address.is_some() {
+                    s.finalizer_address = f.finalizer_address.clone();
                 }
-                s.solvers = solvers.clone();
-                if commit.is_some() {
-                    s.node_commit = commit.clone();
+                s.solvers = f.solvers.clone();
+                if f.git_commit.is_some() {
+                    s.node_commit = f.git_commit.clone();
                 }
             }
 
@@ -241,6 +244,7 @@ impl Poller {
             }
         }
         s.chain = self.get(s, "getblockchaininfo", json!([]));
+        s.deprecation = self.get(s, "getdeprecationinfo", json!([]));
         s.header = match s.chain.get("bestblockhash").and_then(Value::as_str).map(String::from) {
             Some(h) => self.get(s, "getblockheader", json!([h, true])),
             None => Value::Null,

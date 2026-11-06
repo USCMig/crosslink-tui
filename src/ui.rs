@@ -258,7 +258,7 @@ pub fn refresh(s: &mut Cursive) {
     let panel = a.panel.lock().unwrap().clone();
     let read_only = a.read_only;
 
-    // The Crosslink release (v15) when the node's build commit is a release tag, else zebrad's own
+    // The Crosslink release (v17_rc1) when the node's build commit is a release tag, else zebrad's own
     // version, which is the Zebra version Crosslink builds on.
     let release = crate::upgrade::node_release_short(snap.node_commit.as_deref(), &snap.info, &snap.chain)
         .unwrap_or_else(|| snap.info.get("build").and_then(Value::as_str).unwrap_or("?").to_string());
@@ -274,7 +274,10 @@ pub fn refresh(s: &mut Cursive) {
     header.append_plain(format!("    RPC {rpc_url}"));
     let tip = snap.chain.get("blocks").and_then(Value::as_u64).unwrap_or(0);
     if snap.rpc_error.is_none() && crate::upgrade::status_line(&snap.info, &snap.chain, tip, None).1 {
-        header.append_styled("    UPGRADE NODE TO v15", ColorStyle::title_secondary());
+        let to = crate::upgrade::needed_release(&snap.info, &snap.chain).unwrap_or("the latest release");
+        header.append_styled(format!("    UPGRADE NODE TO {to}"), ColorStyle::title_secondary());
+    } else if snap.rpc_error.is_none() && crate::upgrade::end_of_support(&snap.deprecation, tip, None).is_some_and(|(_, warn)| warn) {
+        header.append_styled("    NODE RELEASE NEAR END OF SUPPORT", ColorStyle::title_secondary());
     }
     if dirty {
         header.append_styled("    config: unsaved changes", ColorStyle::title_secondary());
