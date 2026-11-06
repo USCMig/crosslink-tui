@@ -168,8 +168,69 @@ pub fn last_line_with(src: &LogSource, needle: &str) -> Option<String> {
     }
 }
 
-pub fn finalizer_address(src: &LogSource) -> Option<String> {
-    let l = last_line_with(src, "finalizer address: ")?;
+/// What zebrad logs once at startup: its finalizer address, solver count and build commit.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct StartupFacts {
+    pub finalizer_address: Option<String>,
+    pub solvers: Option<String>,
+    pub git_commit: Option<String>,
+}
+
+impl StartupFacts {
+    fn take(&mut self, l: &str) {
+        self.finalizer_address = self.finalizer_address.take().or_else(|| parse_finalizer(l));
+        self.solvers = self.solvers.take().or_else(|| parse_solvers(l));
+        self.git_commit = self.git_commit.take().or_else(|| parse_commit(l));
+    }
+
+    fn complete(&self) -> bool {
+        self.finalizer_address.is_some() && self.solvers.is_some() && self.git_commit.is_some()
+    }
+}
+
+/// The startup facts of the running node. `started` is the unit's `ExecMainStartTimestamp`: the
+/// journal is then read forward from that moment, where the facts sit within the first few hundred
+/// lines. That takes milliseconds, where a pattern search of a busy node's journal can take
+/// minutes. Whatever is not found that way falls back to the search.
+pub fn startup_facts(src: &LogSource, started: Option<&str>) -> StartupFacts {
+    let mut facts = StartupFacts::default();
+    #[cfg(target_os = "linux")]
+    if let (LogSource::Journal(unit), Some(since)) = (src, started.filter(|s| !s.is_empty())) {
+        use std::io::BufRead;
+        const MAX_LINES: usize = 20_000;
+        if let Ok(mut child) = Command::new("journalctl")
+            .args(["-u", unit, "--since", since, "--no-pager", "-o", "cat"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(out) = child.stdout.take() {
+                for l in std::io::BufReader::new(out).lines().map_while(Result::ok).take(MAX_LINES) {
+                    facts.take(&strip_ansi(&l));
+                    if facts.complete() {
+                        break;
+                    }
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = started;
+    if facts.finalizer_address.is_none() {
+        facts.finalizer_address = last_line_with(src, "finalizer address: ").and_then(|l| parse_finalizer(&l));
+    }
+    if facts.solvers.is_none() {
+        facts.solvers = last_line_with(src, "solver_count=").and_then(|l| parse_solvers(&l));
+    }
+    if facts.git_commit.is_none() {
+        facts.git_commit = last_line_with(src, "git commit: ").and_then(|l| parse_commit(&l));
+    }
+    facts
+}
+
+fn parse_finalizer(l: &str) -> Option<String> {
     let i = l.find("finalizer address: ")?;
     let addr: String = l[i + 19..]
         .chars()
@@ -179,15 +240,13 @@ pub fn finalizer_address(src: &LogSource) -> Option<String> {
 }
 
 /// The git commit zebrad was built from, from the `git commit: 68a076c` line it logs at startup.
-pub fn git_commit(src: &LogSource) -> Option<String> {
-    let l = last_line_with(src, "git commit: ")?;
+fn parse_commit(l: &str) -> Option<String> {
     let i = l.find("git commit: ")?;
     let hex: String = l[i + 12..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     (hex.len() >= 7).then_some(hex.to_ascii_lowercase())
 }
 
-pub fn running_solvers(src: &LogSource) -> Option<String> {
-    let l = last_line_with(src, "solver_count=")?;
+fn parse_solvers(l: &str) -> Option<String> {
     let i = l.find("solver_count=")?;
     Some(l[i + 13..].split_whitespace().next()?.to_string())
 }
@@ -221,4 +280,26 @@ pub fn quick_restart(pid: &str) -> Result<(), String> {
     }
     #[cfg(not(target_os = "linux"))]
     Err("quick restart needs systemd (Linux)".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_startup_facts_from_log_lines() {
+        let mut f = StartupFacts::default();
+        for l in [
+            "git commit: 97e7f10",
+            "2026-11-05T13:13:15Z  INFO zebrad::commands::start: finalizer address: zfinv1Abc_d-9 more",
+            "INFO zebrad::components::miner: launching mining tasks with parallel solvers solver_count=6 low_priority=true",
+            "git commit: 0000000",
+        ] {
+            f.take(l);
+        }
+        assert_eq!(f.git_commit.as_deref(), Some("97e7f10"));
+        assert_eq!(f.finalizer_address.as_deref(), Some("zfinv1Abc_d-9"));
+        assert_eq!(f.solvers.as_deref(), Some("6"));
+        assert!(f.complete());
+    }
 }

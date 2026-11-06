@@ -18,12 +18,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--log-file PATH] [--service NAME] [--read-only]
-                     [--miner-address ADDR]
+const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--rpc-cookie PATH] [--log-file PATH] [--service NAME]
+                     [--read-only] [--miner-address ADDR]
 
   --config PATH    zebrad.toml to manage (default: the -c path in the systemd unit's ExecStart,
                    else zebrad's default location for this OS)
   --rpc URL        node JSON-RPC endpoint (default: http://<[rpc] listen_addr>)
+  --rpc-cookie PATH
+                   zebrad's RPC auth cookie, needed from v17 unless [rpc] enable_cookie_auth = false
+                   (default: <[rpc] cookie_dir>/.cookie, else zebrad's default cache dir, ~/.cache/zebra
+                   on Linux)
   --log-file PATH  read node logs from this file (default on Linux: the unit's journal)
   --service NAME   systemd unit running zebrad, Linux only (default: zebra-crosslink)
   --miner-address ADDR
@@ -38,6 +42,7 @@ fn main() {
     let mut service = "zebra-crosslink".to_string();
     let mut config_arg = None;
     let mut rpc_arg = None;
+    let mut cookie_arg = None;
     let mut log_file = None;
     let mut read_only = false;
     let mut miner_address_arg = None;
@@ -47,6 +52,7 @@ fn main() {
             "--service" => service = args.next().unwrap_or_else(|| usage_exit()),
             "--config" => config_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
             "--rpc" => rpc_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
+            "--rpc-cookie" => cookie_arg = Some(PathBuf::from(args.next().unwrap_or_else(|| usage_exit()))),
             "--log-file" => log_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage_exit()))),
             "--read-only" => read_only = true,
             "--miner-address" => miner_address_arg = Some(args.next().unwrap_or_else(|| usage_exit())),
@@ -80,6 +86,12 @@ fn main() {
         let addr = cfg.get_str(&["rpc", "listen_addr"]).unwrap_or_else(|| "127.0.0.1:8232".into());
         format!("http://{addr}")
     });
+    // With cookie auth off the node writes no cookie, and none is sent.
+    let cookie = match cookie_arg {
+        Some(p) => Some(p),
+        None if cfg.get_bool(&["rpc", "enable_cookie_auth"]) == Some(false) => None,
+        None => Some(rpc::default_cookie_path(cfg.get_str(&["rpc", "cookie_dir"]))),
+    };
     let cache_dir = cfg.get_str(&["state", "cache_dir"]);
     let miner_address = miner_address_arg.or_else(|| cfg.get_str(&["mining", "miner_address"])).filter(|a| !a.is_empty());
 
@@ -96,7 +108,7 @@ fn main() {
         let app = ui::App::new(
             snap.clone(),
             cfg.clone(),
-            rpc::Rpc::new(&rpc_url),
+            rpc::Rpc::new(&rpc_url, cookie.clone()),
             service.clone(),
             argv.clone(),
             log_source.describe(),
@@ -109,7 +121,7 @@ fn main() {
 
         let stop = Arc::new(AtomicBool::new(false));
         let poller = poll::Poller {
-            rpc: rpc::Rpc::new(&rpc_url),
+            rpc: rpc::Rpc::new(&rpc_url, cookie.clone()),
             service: service.clone(),
             log_source: log_source.clone(),
             cache_dir: cache_dir.clone(),

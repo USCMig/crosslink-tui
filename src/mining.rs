@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn counts_verdicts_not_messages_and_finds_orphans() {
-        let mut t = Tracker::new(Rpc::new("http://127.0.0.1:9"), LogSource::None, None);
+        let mut t = Tracker::new(Rpc::new("http://127.0.0.1:9", None), LogSource::None, None);
         // The chain now holds a different block at 34865: ours was orphaned.
         t.blocks.insert(34865, ("0000aaaa".into(), 1791576000, false));
         let lines: Vec<String> = [ACCEPTED, DUPLICATE, INVALID].iter().map(|s| s.to_string()).collect();
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn old_lines_are_ignored() {
-        let t = Tracker::new(Rpc::new("http://127.0.0.1:9"), LogSource::None, None);
+        let t = Tracker::new(Rpc::new("http://127.0.0.1:9", None), LogSource::None, None);
         let s = t.log_stats(&[ACCEPTED.to_string()], 1791576000 + 2 * DAY);
         assert_eq!(s.accepted_24h, 0);
     }
