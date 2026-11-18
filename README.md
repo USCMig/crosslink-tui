@@ -11,24 +11,64 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 
 | Panel | What it does |
 |---|---|
-| Basic Status | Node release (for example v17_rc1), sync state, peers, disk use, chain tip, network upgrade status, the height at which this node release stops running, BFT finality summary, mempool, wallet balances |
+| Basic Status | Node release (for example v17_rc1), sync state, peers, disk use, chain tip, the FeaturenetUpgrade2 countdown, the height at which this node release stops running, BFT finality summary, mempool, wallet balances |
 | Peers and Sync | PoW peers (address, direction, agent, last message, ping) and BFT peers |
 | Mining | Edit the internal miner's payout address, threads, enabled and low-priority settings; shows running solvers and any GPU solver configured in systemd. Mining health: blocks found in the last hour and day, share of blocks and the Sol/s it implies, and, from the node's logs, accepted and rejected submits, blocks orphaned after acceptance, solutions discarded before submit, and GPU solver failures |
-| Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw staking-action editor. On v15 nodes, enforces power-of-10 bond amounts and offers the nearest valid amounts |
-| Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. Shows how old the ranking is and greys it out once it passes the index's own freshness limit. A `seat` column shows actual committee membership from the node's voting roster, kept separate from bonded rank; until BFT starts the roster is empty and the top-12 line is labelled a projection |
+| Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw staking-action editor. Enforces power-of-10 bond amounts and offers the nearest valid amounts |
+| Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. Shows how old the ranking is and greys it out once it passes the index's own freshness limit. A `seat` column shows actual committee membership from the node's voting roster, kept separate from bonded rank |
 | BFT Finality | Health, BFT height/round/step, finality gap and quorum power; finality trend (decisions per 10 minutes and per hour, time per decision, a finality-gap sparkline); per-finalizer votes; round diagnosis; a block browser for any decided BFT block. Works on any node through `get_tfl_recency_status`; the diagnostic RPCs add health checks, power and round detail |
 | Config | Every value in `zebrad.toml`: edit, add, remove, save, reload, or open in `$EDITOR` |
 | Node Control | Service state; start, stop and restart with `sudo systemctl`, or a quick restart without sudo (Linux with systemd) |
 | Logs | Live node logs with filters (warnings, mining, staking/BFT, wallet) |
-| Version Info | Node release and the Zebra version it is based on, protocol version, network upgrade status, end of support, which staking RPC the node uses, binary, config, unit and drop-in files, finalizer address |
+| Version Info | Node release and the Zebra version it is based on, protocol version, network upgrade status, end of support, binary, config, unit and drop-in files, finalizer address, which extra RPCs the node has |
 
-The header shows the node's release (for example `Crosslink Node v17_rc1`), its status, its BFT height (`BFT STALLED` after 5 minutes without a
-decision), `UPGRADE NODE TO v17` when the node lacks a scheduled network upgrade, and
-`NODE RELEASE NEAR END OF SUPPORT` in the week before the node release stops running.
+The header shows the node's release (for example `Crosslink Node v17_rc1`), its status and its BFT
+height (`BFT STALLED` after 5 minutes without a decision). It also shows `UPGRADE NODE TO v17` when
+the node is not on v17, and `NODE RELEASE NEAR END OF SUPPORT` in the week before the node release
+stops running.
 
 Config saves keep comments and layout, write a timestamped `.bak` next to the file first, and refuse
 to overwrite a file that changed on disk. Staking actions and node start/stop/restart ask for
 confirmation, with Cancel selected by default.
+
+## Node v17
+
+The TUI targets node release v17 (`ShieldedLabs/crosslink_monolith`, tag `v17_rc1`, a release
+candidate). What matters on v17:
+
+| | What it means | What the TUI does |
+|---|---|---|
+| Hard fork `FeaturenetUpgrade2` at PoW height 165,000 | Nodes not on v17 are cut off at the fork | Basic Status and Version Info show the fork height with an ETA from recent block times |
+| End of support at height 188,376 | v17_rc1 refuses to run past it, so upgrade to the next release before then | Basic Status and Version Info show the height and an ETA (from `getdeprecationinfo`); the header warns in the last week |
+| RPC cookie auth is on by default | Every RPC without zebrad's cookie is refused with HTTP 401 | The TUI sends the cookie (see below) |
+| Strict BFT quorum from the fork | A decision needs more than two thirds of the active stake, `floor(2n/3)+1`, instead of `2f+1`. Finality needs finalizers holding more than two thirds of the stake to run v17 | The vote table and the v17 extra-RPC patch compute the quorum the way the node does |
+| Bonds must be a power of 10 zats | 1, 10, 100, 1000 cTAZ and so on. Unbonding and withdrawing take any amount | Staking refuses other amounts and offers the nearest valid ones; Fill max picks the largest that fits |
+| Staking RPC is `wallet_staking_action` | It takes the action as a JSON object; `target_finalizer` is the finalizer's `zfinv1...` address | Staking actions use it |
+| Lightwallet gRPC server listens on localhost only | Set `public_lightwallet_server` to serve other machines | Nothing; the TUI does not use it |
+
+### RPC cookie
+
+With cookie auth on, zebrad writes a new cookie each time it starts, to `.cookie` in `[rpc]
+cookie_dir`. That defaults to zebrad's cache directory, `~/.cache/zebra` on Linux, which is not
+`[state] cache_dir`. The TUI reads the cookie again on every call, so a node restart does not break
+it. `--rpc-cookie PATH` points it elsewhere, for example at a cookie copied from another machine.
+If the node refuses the cookie, or there is none, the status line says which.
+
+With `[rpc] enable_cookie_auth = false` in the node config, the TUI sends no cookie. Your own
+scripts that call the RPC need the cookie when auth is on, for example:
+
+```sh
+curl -s -u "$(cat ~/.cache/zebra/.cookie)" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}' http://127.0.0.1:8232
+```
+
+### Upgrading the node
+
+1. Build v17 from source (tag `v17_rc1`), or use the release binary for your platform.
+2. Stop the node and back up its cache directory. It holds the chain, the wallet seed and the wallet
+   snapshot.
+3. Put the v17 binary in place and start the node with the same config. The cache directory and
+   the config format are unchanged, so the node resumes where it stopped; no resync is needed.
 
 ## Platforms
 
@@ -83,8 +123,11 @@ that scripts or other tools already manage, or a node on another machine through
 
 ```sh
 crosslink-tui --read-only
-crosslink-tui --read-only --rpc http://10.0.0.5:8232   # a remote node; logs and service control need it local
+crosslink-tui --read-only --rpc http://10.0.0.5:8232 --rpc-cookie ./node.cookie   # a remote node
 ```
+
+A remote node needs `[rpc] listen_addr` reachable from this machine, and its cookie copied over when
+cookie auth is on. Logs and service control need the TUI on the node's machine.
 
 zebrad's default config locations are `~/.config/zebrad.toml` (Linux),
 `~/Library/Preferences/zebrad.toml` (macOS) and `%APPDATA%\zebrad.toml` (Windows). To get a log file
@@ -92,61 +135,20 @@ when you start zebrad yourself, redirect its output, for example `zebrad start >
 
 ## Requirements
 
-- A Crosslink `zebrad` node with RPC enabled, v17, v16, v15 or v14. Every panel runs on the upstream releases;
-  six of the RPCs the TUI can use are extras the upstream releases do not have (see below).
+- A Crosslink `zebrad` v17 node with RPC enabled. Every panel runs on the upstream release; six of
+  the RPCs the TUI can use are extras the upstream release does not have (see below).
 - Linux service control: the node runs as a systemd unit (default name `zebra-crosslink`), and the
   user running the TUI can read its journal (for example, as a member of `adm` or
   `systemd-journal`).
 
-## Node v17
-
-Node release v17 (tag `v17_rc1` so far, a release candidate) schedules a second hard fork,
-`FeaturenetUpgrade2`, at PoW height 165,000. A node on v16 or older stops at its end of support
-(v16: height 164,184) and could not follow the fork anyway. What changes for this TUI:
-
-| v17 change | What the TUI does |
-|---|---|
-| Hard fork at 165,000 | Basic Status and Version Info show it with an ETA. A node that lacks it gets `UPGRADE NODE TO v17` in the header |
-| RPC cookie auth is on by default (`[rpc] enable_cookie_auth`). Without the cookie every RPC is refused with HTTP 401 | The TUI reads zebrad's `.cookie` and sends it with every call. It reads the file again on each call, because zebrad writes a new cookie each time it starts. It looks in `[rpc] cookie_dir`, else zebrad's default cache directory (`~/.cache/zebra` on Linux, which is not `[state] cache_dir`); `--rpc-cookie PATH` overrides that. A node with `enable_cookie_auth = false` gets no cookie, as before |
-| From the fork, BFT decides by a strict two-thirds quorum, `floor(2n/3)+1` of the active stake, instead of `2f+1` | The vote table computes the quorum the way the node does, from the finalized height. The v17 extra-RPC patch does the same for `get_tfl_finality_status` and `get_tfl_round_diagnosis` |
-| End of support: v17_rc1 stops running at height 188,376 | Basic Status and Version Info show the height and an ETA, from `getdeprecationinfo`; the header warns in the last week |
-| The lightwallet gRPC server listens on localhost only unless `public_lightwallet_server` is set | Nothing to change; the TUI does not use it |
-
-The bond rules (power-of-10 amounts) and staking RPC are the same as v15. The cache directory and
-config format did not change, so upgrading is: stop the node, back up its cache directory, put the
-v17 binary in place, start it with the same config. If your config sets nothing about cookie auth,
-the node turns it on, and any script of your own that calls the RPC needs the cookie too.
-
-## Node v15
-
-Node release v15 (`ShieldedLabs/crosslink_monolith`, tag `v15`) schedules a hard fork,
-`FeaturenetUpgrade1`, at PoW height 55,296. A node still on v14 after that height is cut off by its
-peers. What changes for this TUI:
-
-| v15 change | What the TUI does |
-|---|---|
-| Hard fork at 55,296 | Basic Status and Version Info show the upgrade and an ETA from recent block times. A v14 node gets `UPGRADE NODE TO v15` in the header |
-| `staking_command` is removed; `wallet_staking_action` replaces it and takes the action as a JSON object | Staking actions use `wallet_staking_action` on v15 nodes and `staking_command` on v14 nodes, and fall back to the other one if the node lacks it |
-| A new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ and so on). The v15 wallet refuses other amounts at once, and consensus rejects them from the fork | Staking refuses other amounts and offers the nearest valid ones; Fill max picks the largest that fits |
-| New issuance split (90% to bonds, 10% to active finalizers) from the fork | Nothing to change; rewards show up as before |
-| BFT fix for a proposer that sends two proposals in one round, which used to stall nodes until restarted | The BFT Finality panel and the header's `BFT STALLED` show whether your node is deciding |
-
-`target_finalizer` in a staking action is the finalizer's `zfinv1...` address. The v15 release notes
-show a hex key, but the node accepts only the address.
-
-To upgrade, build v15 (or use the release binary for your platform), stop the node, back up its
-cache directory (it holds the chain, the wallet seed and the wallet snapshot), put the v15 binary in
-place and start the node with the same config. The cache directory name and the config format did
-not change, so the node resumes where it stopped; no resync is needed. Upgrade before height 55,296.
-
 ## Node RPCs
 
-These RPCs ship with the upstream releases: `getinfo`, `getblockchaininfo`, `getblockheader`,
-`getblockhash`, `getblock`, `getmininginfo`, `getmempoolinfo`, `getpeerinfo`, `get_tfl_roster_zats`,
-`get_tfl_final_block_height_and_hash`, `get_tfl_recency_status`, `wallet_staking_positions` and
-`wallet_spendable_funds`, `getdeprecationinfo`, plus `wallet_staking_action` (v15 and later) or `staking_command` (v14).
+These RPCs ship with v17: `getinfo`, `getblockchaininfo`, `getblockheader`, `getblockhash`,
+`getblock`, `getmininginfo`, `getmempoolinfo`, `getpeerinfo`, `getdeprecationinfo`,
+`get_tfl_roster_zats`, `get_tfl_final_block_height_and_hash`, `get_tfl_recency_status`,
+`wallet_staking_positions`, `wallet_spendable_funds` and `wallet_staking_action`.
 
-These six are **not part of the upstream releases**. The TUI uses them when the node has them, and
+These six are **not part of the upstream release**. The TUI uses them when the node has them, and
 otherwise falls back or says on screen which one is missing:
 
 | RPC | Used for | Without it |
@@ -162,18 +164,14 @@ Version Info lists which of the six the connected node is missing.
 
 ## Adding the extra RPCs to your node
 
-Three patches add all six, one per node release:
+[`node-patches/v17-extra-rpcs.patch`](node-patches/v17-extra-rpcs.patch) adds all six to a v17
+node. It only reads state the node already keeps and changes no consensus, networking or wallet
+behaviour. Its quorum figures follow the strict quorum from FeaturenetUpgrade2, as consensus does.
+It touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`, and in `zebra-crosslink/`:
+`zebra-crosslink/src/lib.rs`, `zebra-rpc/src/methods.rs`, `zebra-state/src/crosslink.rs` and
+`zebra-state/src/new_network/bft.rs`.
 
-- [`node-patches/v17-extra-rpcs.patch`](node-patches/v17-extra-rpcs.patch) for v17 (`v17_rc1`)
-- [`node-patches/v15-extra-rpcs.patch`](node-patches/v15-extra-rpcs.patch) for v15 (it also applies to v16)
-- [`node-patches/v14-extra-rpcs.patch`](node-patches/v14-extra-rpcs.patch) for v14
-
-They only read state the node already keeps; neither changes consensus, networking or wallet
-behaviour. Each touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`, and in
-`zebra-crosslink/`: `zebra-crosslink/src/lib.rs`, `zebra-rpc/src/methods.rs`,
-`zebra-state/src/crosslink.rs` and `zebra-state/src/new_network/bft.rs`.
-
-1. Get the source for your release, or go to your existing checkout:
+1. Get the v17 source, or go to your existing checkout:
 
    ```sh
    git clone https://github.com/ShieldedLabs/crosslink_monolith
@@ -181,8 +179,8 @@ behaviour. Each touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`,
    git checkout v17_rc1
    ```
 
-2. Apply the matching patch from the repository root. The check step changes nothing; it only
-   reports whether the patch fits:
+2. Apply the patch from the repository root. The check step changes nothing; it only reports
+   whether the patch fits:
 
    ```sh
    git apply --check /path/to/crosslink-tui/node-patches/v17-extra-rpcs.patch
@@ -204,15 +202,13 @@ behaviour. Each touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`,
    are untouched.
 
 5. Check it worked: Version Info should show `Extra RPCs (not upstream): all present`, or from a
-   shell:
+   shell (drop `-u ...` if cookie auth is off):
 
    ```sh
-   curl -s -X POST -H 'Content-Type: application/json' \
+   curl -s -u "$(cat ~/.cache/zebra/.cookie)" -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","method":"get_tfl_finality_status","params":[],"id":1}' \
      http://127.0.0.1:8232
    ```
-
-   With cookie auth on (the v17 default), add `-u "$(cat ~/.cache/zebra/.cookie)"`.
 
 A later node release may already include these RPCs, or may need the patch updated.
 
@@ -235,35 +231,32 @@ A later node release may already include these RPCs, or may need the patch updat
   "successfully mined a new block" whatever the verdict, so the counts use its `success=` value.
   A few discarded solutions an hour are normal: they are the built-in CPU solver's known bad
   solutions, which the node's own check throws away before submitting.
-
 - **Data age:** if the node's RPC stops answering, the header shows `NOT LIVE` and node panels say
   how long ago their values were last current. The Top Stakers ranking shows the block and time the
   index observed, and is marked `EXPIRED` once it is older than the index's `max_age_seconds`
   (75 seconds today), because a failed refresh keeps the previous list on screen.
-
 - **Restarts:** Start, Stop and Restart run `sudo systemctl ...`. The TUI steps aside so you can type
   your sudo password, then comes back. Quick restart sends SIGTERM to the node and relies on the
   unit's `Restart=always` to bring it back.
-- **Staking window:** the window shown in the Staking panel uses the feature net defaults
-  (10368-block period, 3456-block window, first window at height 20736); v15 to v17 did not change them.
-  The window that opens at 51,840 closes at 55,295, the block before the v15 fork.
+- **Staking window:** the window shown in the Staking panel uses the feature net defaults: a
+  10368-block period with a 3456-block window at its start.
 - **Finality trend:** the trend numbers come from what the TUI has watched since it started, so they
   fill in over the first hour. The block browser reads any decided BFT block by height.
-- **Finalizer address:** this node's finalizer address is read from the startup line zebrad writes
-  to its log. With systemd, the TUI reads the journal forward from the moment the node started,
-  which stays fast however busy the journal is.
-- **Node release:** zebrad logs the git commit it was built from at startup. When that commit is an
-  upstream release tag, the TUI names the release (`v17_rc1 (commit 97e7f10)`); a build with local
-  patches on top of a tag still reports the tag's commit. Without the log (a remote node), the release
-  family is inferred from the protocol version and the upgrades the node schedules (`v17 or later`). `zebrad build` (`v6.2.3`) is the
-  Zebra version Crosslink is based on, not the Crosslink release.
+- **Startup facts:** the finalizer address, solver count and build commit come from lines zebrad
+  writes to its log at startup. With systemd, the TUI reads the journal forward from the moment the
+  node started, which stays fast however busy the journal is.
+- **Node release:** when the build commit is an upstream release tag, the TUI names the release
+  (`v17_rc1 (commit 97e7f10)`); a build with local patches on top of a tag still reports the tag's
+  commit. Without the log (a remote node), the release is inferred from the protocol version and the
+  upgrades the node schedules (`v17 or later`). `zebrad build` (`v6.2.3`) is the Zebra version
+  Crosslink is based on, not the Crosslink release.
 - **One outbound request:** the Top Stakers page fetches the public roster document at
   `https://ctaz.cash/v14/api/roster` about every 45 seconds. It is a plain GET that sends no node or
   wallet data, but that site sees your IP address. Every other panel talks only to your own node.
 
 ## Releases
 
-Pushing a tag such as `v0.2.0` runs `.github/workflows/release.yml`, which builds Linux (x86_64,
+Pushing a tag such as `v0.5.0` runs `.github/workflows/release.yml`, which builds Linux (x86_64,
 aarch64), macOS (Apple Silicon, Intel) and Windows (x86_64) binaries and attaches them to a GitHub
 release for that tag.
 
