@@ -114,7 +114,7 @@ pub fn basic(snap: &Snap) -> String {
     let mut o = String::new();
     line(&mut o, "Current Status", status_word(snap));
     line(&mut o, "Node Release", crate::upgrade::node_release(snap.node_commit.as_deref(), &snap.info, &snap.chain));
-    line(&mut o, "Connected Peers", opt(u(&snap.info, "connections")));
+    line(&mut o, "Connected Peers", connected_peers(snap));
     line(&mut o, "Disk Usage (GB)", snap.disk_bytes.map(|b| format!("{:.3}", b as f64 / 1e9)).unwrap_or("-".into()));
     o.push_str(RULE);
     o.push('\n');
@@ -183,12 +183,78 @@ fn finality_health(f: &Value) -> String {
     }
 }
 
+fn node_is_v18(snap: &Snap) -> bool {
+    crate::upgrade::node_is_v18(&snap.info, &snap.chain)
+}
+
+/// Peers against this node's finalized height: (at it, behind it, ahead of it). Heights only: a
+/// peer at the same height has not been checked to hold the same block.
+fn net_agreement(n: &crate::node::NetView) -> (usize, usize, usize) {
+    let mut c = (0, 0, 0);
+    if let Some(mine) = n.finalized {
+        for p in n.peers.iter().filter_map(|p| p.finalized) {
+            match p.cmp(&mine) {
+                std::cmp::Ordering::Equal => c.0 += 1,
+                std::cmp::Ordering::Less => c.1 += 1,
+                std::cmp::Ordering::Greater => c.2 += 1,
+            }
+        }
+    }
+    c
+}
+
+fn connected_peers(snap: &Snap) -> String {
+    match &snap.net {
+        Some(n) => format!("{} ({} at your finalized height)", n.peers.len(), net_agreement(n).0),
+        None if node_is_v18(snap) => "- (not in the node log for the last minute; see Peers)".into(),
+        None => opt(u(&snap.info, "connections")),
+    }
+}
+
 pub fn peers(snap: &Snap) -> String {
     let mut o = String::new();
+    let v18 = node_is_v18(snap);
+    if let Some(n) = &snap.net {
+        let (same, behind, ahead) = net_agreement(n);
+        let _ = writeln!(o, "Network peers ({})\n", n.peers.len());
+        let _ = writeln!(o, "From v18, one UDP port carries PoW sync, BFT votes and transactions.");
+        let _ = writeln!(o, "Your node: finalized {}, tip {}", opt(n.finalized), opt(n.tip));
+        let _ = writeln!(o, "Peers at your finalized height: {same}, behind: {behind}, ahead: {ahead}\n");
+        let _ = writeln!(o, "{:<12} {:>10} {:>10}  {}", "Peer", "Finalized", "Tip", "Finalized vs yours");
+        let mut list = n.peers.clone();
+        list.sort_by(|a, b| b.finalized.cmp(&a.finalized).then_with(|| a.id.cmp(&b.id)));
+        for p in &list {
+            let vs = match (p.finalized, n.finalized) {
+                (Some(a), Some(b)) if a == b => "same".to_string(),
+                (Some(a), Some(b)) if a < b => format!("{} behind", b - a),
+                (Some(a), Some(b)) => format!("{} ahead", a - b),
+                _ => "-".into(),
+            };
+            let _ = writeln!(o, "{:<12} {:>10} {:>10}  {vs}", short(&p.id, 12), opt(p.finalized), opt(p.tip));
+        }
+        o.push('\n');
+        o.push_str(RULE);
+        o.push('\n');
+    } else if v18 {
+        o.push_str("Network peers: none read. v18 has no RPC for its peers, so the TUI reads the status line the\n");
+        o.push_str("node logs every few seconds, and found none in the last minute (node stopped, or no readable\n");
+        o.push_str("log: pass --log-file when the node does not run under systemd).\n\n");
+        o.push_str(RULE);
+        o.push('\n');
+    }
     let list = snap.peers.as_array().cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
-    let _ = writeln!(o, "PoW peers ({})\n", list.len());
-    let _ = writeln!(o, "{:<24} {:<4} {:<15} {:>9} {:>9}", "Address", "Dir", "Agent", "Last recv", "Ping ms");
+    if v18 {
+        let _ = writeln!(o, "Legacy Zcash peers ({})\n", list.len());
+        if list.is_empty() {
+            o.push_str("None: v18 turns the legacy Zcash network off by default.\n");
+        }
+    } else {
+        let _ = writeln!(o, "PoW peers ({})\n", list.len());
+    }
+    if !list.is_empty() || !v18 {
+        let _ = writeln!(o, "{:<24} {:<4} {:<15} {:>9} {:>9}", "Address", "Dir", "Agent", "Last recv", "Ping ms");
+    }
     for p in &list {
         let dir = if p.get("inbound").and_then(Value::as_bool).unwrap_or(false) { "in" } else { "out" };
         let last = i(p, "lastrecv").map(|t| age(now - t)).unwrap_or("-".into());
@@ -433,7 +499,8 @@ struct Seat {
     me: bool,
 }
 
-/// One voting-roster member as this node reports it (`get_tfl_roster_zats`).
+/// One voting-roster member as this node reports it (`get_tfl_roster_with_addresses`, or
+/// `get_tfl_roster_zats` before v18).
 struct Member {
     /// Lowercase hex in the RPC's raw byte order.
     pk: String,
@@ -705,7 +772,7 @@ pub fn top_stakers(snap: &Snap) -> StyledString {
     if known {
         let total_power: u64 = members.iter().map(|m| m.power).sum();
         out.append_plain("\n");
-        out.append_styled("Committee from your node (get_tfl_roster_zats), by voting power\n", ColorStyle::title_primary());
+        out.append_styled("Committee from your node, by voting power\n", ColorStyle::title_primary());
         out.append_styled(format!("{:>4}  {:<22} {:>16} {:>7}  {}\n", "seat", "finalizer", "voting power", "share", "bonded rank"), dim);
         for (i, m) in members.iter().enumerate() {
             let board_rank = rows.iter().position(|r| seat_of(r, std::slice::from_ref(m)).is_some()).map(|r| r + 1);

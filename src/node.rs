@@ -230,6 +230,68 @@ pub fn startup_facts(src: &LogSource, started: Option<&str>) -> StartupFacts {
     facts
 }
 
+/// One peer on the v18 network as the node's status line reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetPeer {
+    /// The peer's short identity, as the node prints it.
+    pub id: String,
+    pub finalized: Option<u64>,
+    pub tip: Option<u64>,
+}
+
+/// The node's view of the v18 network. v18 has no RPC for its peers; zebrad logs this line every
+/// few seconds instead:
+/// `tip height: Some(169382), finalized height: Some(169376), peers: ["hTDw1w@169376/169382", ..]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NetView {
+    pub tip: Option<u64>,
+    pub finalized: Option<u64>,
+    pub peers: Vec<NetPeer>,
+}
+
+const NET_LINE: &str = "new_network: tip height: ";
+
+/// The latest v18 network status line from the last minute of the log, or `None` when there is
+/// none (a node before v18, a stopped node, or no readable log).
+pub fn net_view(src: &LogSource) -> Option<NetView> {
+    let lines = match src {
+        LogSource::File(p) => file_tail(p, 2 << 20),
+        #[cfg(target_os = "linux")]
+        LogSource::Journal(unit) => Command::new("journalctl")
+            .args(["-u", unit, "--since", "-60s", "--no-pager", "-o", "cat"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(strip_ansi).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    lines.iter().rev().find_map(|l| parse_net_view(l))
+}
+
+fn parse_net_view(l: &str) -> Option<NetView> {
+    let rest = &l[l.find(NET_LINE)? + NET_LINE.len() - "tip height: ".len()..];
+    // `Some(123)` or `None`.
+    let field = |name: &str| -> Option<u64> {
+        let v = &rest[rest.find(name)? + name.len()..];
+        v.strip_prefix("Some(")?.split(')').next()?.parse().ok()
+    };
+    let peers = match rest.find("peers: [") {
+        Some(i) => {
+            let list = &rest[i + 8..];
+            let list = &list[..list.find(']').unwrap_or(list.len())];
+            list.split(',')
+                .filter_map(|e| {
+                    let e = e.trim().trim_matches('"');
+                    let (id, heights) = e.rsplit_once('@')?;
+                    let (fin, tip) = heights.split_once('/')?;
+                    Some(NetPeer { id: id.to_string(), finalized: fin.parse().ok(), tip: tip.parse().ok() })
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    Some(NetView { tip: field("tip height: "), finalized: field("finalized height: "), peers })
+}
+
 fn parse_finalizer(l: &str) -> Option<String> {
     let i = l.find("finalizer address: ")?;
     let addr: String = l[i + 19..]
@@ -285,6 +347,19 @@ pub fn quick_restart(pid: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_v18_network_status_line() {
+        let l = "2026-11-18T01:24:32.405398Z  INFO zebra_state::new_network: tip height: Some(169382), finalized height: Some(169376), peers: [\"hTDw1w@169376/169382\", \"-MlOCo@168816/168915\", \"a@b@?/7\"]";
+        let v = parse_net_view(l).unwrap();
+        assert_eq!((v.tip, v.finalized), (Some(169382), Some(169376)));
+        assert_eq!(v.peers.len(), 3);
+        assert_eq!(v.peers[1], NetPeer { id: "-MlOCo".into(), finalized: Some(168816), tip: Some(168915) });
+        assert_eq!(v.peers[2], NetPeer { id: "a@b".into(), finalized: None, tip: Some(7) });
+        let v = parse_net_view("new_network: tip height: None, finalized height: None, peers: []").unwrap();
+        assert_eq!(v, NetView::default());
+        assert!(parse_net_view("tip height: Some(1)").is_none());
+    }
 
     #[test]
     fn reads_startup_facts_from_log_lines() {
