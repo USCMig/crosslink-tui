@@ -11,10 +11,10 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 
 | Panel | What it does |
 |---|---|
-| Basic Status | Node release (for example v17_rc1), sync state, peers, disk use, chain tip, the FeaturenetUpgrade2 countdown, the height at which this node release stops running, BFT finality summary, mempool, wallet balances |
-| Peers and Sync | PoW peers (address, direction, agent, last message, ping) and BFT peers |
+| Basic Status | Node release (for example v18), sync state, peers, disk use, chain tip, the FeaturenetUpgrade3 countdown, the height at which this node release stops running, BFT finality summary, mempool, wallet balances |
+| Peers and Sync | Peers on the v18 network with their finalized and tip heights next to yours, how many are at your finalized height, behind or ahead; legacy Zcash peers if that network is on; BFT peers |
 | Mining | Edit the internal miner's payout address, threads, enabled and low-priority settings; shows running solvers and any GPU solver configured in systemd. Mining health: blocks found in the last hour and day, share of blocks and the Sol/s it implies, and, from the node's logs, accepted and rejected submits, blocks orphaned after acceptance, solutions discarded before submit, and GPU solver failures |
-| Staking | Staking window, roster, stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw staking-action editor. Enforces power-of-10 bond amounts and offers the nearest valid amounts |
+| Staking | Staking window, roster with each finalizer's address (yours marked), stake to a roster finalizer or to this node; list your bonds and unbond, withdraw or retarget them; raw staking-action editor. Enforces power-of-10 bond amounts and offers the nearest valid amounts |
 | Top Stakers | Bonded-stake ranking from the public cTAZ roster (`ctaz.cash`), with a bar for each finalizer. Shows how old the ranking is and greys it out once it passes the index's own freshness limit. A `seat` column shows actual committee membership from the node's voting roster, kept separate from bonded rank |
 | BFT Finality | Health, BFT height/round/step, finality gap and quorum power; finality trend (decisions per 10 minutes and per hour, time per decision, a finality-gap sparkline); per-finalizer votes; round diagnosis; a block browser for any decided BFT block. Works on any node through `get_tfl_recency_status`; the diagnostic RPCs add health checks, power and round detail |
 | Config | Every value in `zebrad.toml`: edit, add, remove, save, reload, or open in `$EDITOR` |
@@ -22,29 +22,33 @@ endpoint, its `zebrad.toml`, its logs and, on Linux, its systemd unit.
 | Logs | Live node logs with filters (warnings, mining, staking/BFT, wallet) |
 | Version Info | Node release and the Zebra version it is based on, protocol version, network upgrade status, end of support, binary, config, unit and drop-in files, finalizer address, which extra RPCs the node has |
 
-The header shows the node's release (for example `Crosslink Node v17_rc1`), its status and its BFT
-height (`BFT STALLED` after 5 minutes without a decision). It also shows `UPGRADE NODE TO v17` when
-the node is not on v17, and `NODE RELEASE NEAR END OF SUPPORT` in the week before the node release
+The header shows the node's release (for example `Crosslink Node v18`), its status and its BFT
+height (`BFT STALLED` after 5 minutes without a decision). It also shows `UPGRADE NODE TO v18` when
+the node is not on v18, and `NODE RELEASE NEAR END OF SUPPORT` in the week before the node release
 stops running.
 
 Config saves keep comments and layout, write a timestamped `.bak` next to the file first, and refuse
 to overwrite a file that changed on disk. Staking actions and node start/stop/restart ask for
 confirmation, with Cancel selected by default.
 
-## Node v17
+## Node v18
 
-The TUI targets node release v17 (`ShieldedLabs/crosslink_monolith`, tag `v17_rc1`, a release
-candidate). What matters on v17:
+The TUI targets node release v18 (`ShieldedLabs/crosslink_monolith`, tag `v18`). What matters on
+v18:
 
 | | What it means | What the TUI does |
 |---|---|---|
-| Hard fork `FeaturenetUpgrade2` at PoW height 165,000 | Nodes not on v17 are cut off at the fork | Basic Status and Version Info show the fork height with an ETA from recent block times |
-| End of support at height 188,376 | v17_rc1 refuses to run past it, so upgrade to the next release before then | Basic Status and Version Info show the height and an ETA (from `getdeprecationinfo`); the header warns in the last week |
-| RPC cookie auth is on by default | Every RPC without zebrad's cookie is refused with HTTP 401 | The TUI sends the cookie (see below) |
-| Strict BFT quorum from the fork | A decision needs more than two thirds of the active stake, `floor(2n/3)+1`, instead of `2f+1`. Finality needs finalizers holding more than two thirds of the stake to run v17 | The vote table and the v17 extra-RPC patch compute the quorum the way the node does |
+| New peer-to-peer network | A v18 node cannot talk to a v17 one. PoW sync, BFT votes and transactions all travel over one UDP port | Peers and Sync lists the v18 peers and compares their heights with yours |
+| One network port | `[state] network_local_port` sets the port, and `0` picks a random one on every start. `[network] public_address` now supplies only the IP to advertise. Pin the port if your router forwards one | Nothing; edit it in Config |
+| Legacy Zcash network off by default | `getpeerinfo` lists nothing and `getinfo` reports 0 connections | Connected Peers counts v18 peers instead. v18 has no RPC for them, so the TUI reads the status line the node logs every few seconds (systemd journal or `--log-file`) |
+| Config fields removed | `[crosslink]` rejects unknown fields, so a node whose config still has `disable_zaino` does not start. `bft_peers` is ignored: BFT finds its peers over the new network | Delete stale fields in Config |
+| Hard fork `FeaturenetUpgrade3` at PoW height 189,000 | Nodes not on v18 are cut off at the fork. From it, a staking action on an existing bond names the bond's current version (the txid of the last transaction that created or acted on it); the node's wallet fills that in | Basic Status and Version Info show the fork height with an ETA from recent block times. Staking actions are unchanged |
+| End of support at height 212,568 | v18 refuses to run past it, so upgrade to the next release before then | Basic Status and Version Info show the height and an ETA (from `getdeprecationinfo`); the header warns in the last week |
+| `get_tfl_roster_with_addresses` | New RPC: the voting roster with each finalizer's `zfinv1...` address, which `get_tfl_roster_zats` leaves empty | The Staking roster uses it, so you can stake to any roster finalizer |
+| RPC cookie auth is on by default (since v17) | Every RPC without zebrad's cookie is refused with HTTP 401 | The TUI sends the cookie (see below) |
+| Strict BFT quorum (since FeaturenetUpgrade2) | A decision needs more than two thirds of the active stake, `floor(2n/3)+1`. Finality stalls until finalizers holding that much stake run a release that can talk to each other | The vote table and the extra-RPC patch compute the quorum the way the node does |
 | Bonds must be a power of 10 zats | 1, 10, 100, 1000 cTAZ and so on. Unbonding and withdrawing take any amount | Staking refuses other amounts and offers the nearest valid ones; Fill max picks the largest that fits |
 | Staking RPC is `wallet_staking_action` | It takes the action as a JSON object; `target_finalizer` is the finalizer's `zfinv1...` address | Staking actions use it |
-| Lightwallet gRPC server listens on localhost only | Set `public_lightwallet_server` to serve other machines | Nothing; the TUI does not use it |
 
 ### RPC cookie
 
@@ -62,13 +66,19 @@ curl -s -u "$(cat ~/.cache/zebra/.cookie)" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}' http://127.0.0.1:8232
 ```
 
-### Upgrading the node
+### Upgrading the node from v17
 
-1. Build v17 from source (tag `v17_rc1`), or use the release binary for your platform.
+1. Build v18 from source (tag `v18`), or use the release binary for your platform.
 2. Stop the node and back up its cache directory. It holds the chain, the wallet seed and the wallet
    snapshot.
-3. Put the v17 binary in place and start the node with the same config. The cache directory and
-   the config format are unchanged, so the node resumes where it stopped; no resync is needed.
+3. In the config, delete `disable_zaino` from `[crosslink]` if it is there, and set
+   `[state] network_local_port` to the port your router forwards (the port of `public_address`).
+4. Put the v18 binary in place and start the node. It resumes from the same cache directory; no
+   resync is needed. Do not go back to v17 on that cache directory afterwards: per the v18 release,
+   that is not supported.
+
+Finality waits until finalizers holding more than two thirds of the stake have upgraded, while PoW
+blocks keep coming. BFT Finality shows who is voting.
 
 ## Platforms
 
@@ -135,7 +145,7 @@ when you start zebrad yourself, redirect its output, for example `zebrad start >
 
 ## Requirements
 
-- A Crosslink `zebrad` v17 node with RPC enabled. Every panel runs on the upstream release; six of
+- A Crosslink `zebrad` v18 node with RPC enabled. Every panel runs on the upstream release; six of
   the RPCs the TUI can use are extras the upstream release does not have (see below).
 - Linux service control: the node runs as a systemd unit (default name `zebra-crosslink`), and the
   user running the TUI can read its journal (for example, as a member of `adm` or
@@ -143,9 +153,9 @@ when you start zebrad yourself, redirect its output, for example `zebrad start >
 
 ## Node RPCs
 
-These RPCs ship with v17: `getinfo`, `getblockchaininfo`, `getblockheader`, `getblockhash`,
+These RPCs ship with v18: `getinfo`, `getblockchaininfo`, `getblockheader`, `getblockhash`,
 `getblock`, `getmininginfo`, `getmempoolinfo`, `getpeerinfo`, `getdeprecationinfo`,
-`get_tfl_roster_zats`, `get_tfl_final_block_height_and_hash`, `get_tfl_recency_status`,
+`get_tfl_roster_with_addresses` (`get_tfl_roster_zats` on older nodes), `get_tfl_final_block_height_and_hash`, `get_tfl_recency_status`,
 `wallet_staking_positions`, `wallet_spendable_funds` and `wallet_staking_action`.
 
 These six are **not part of the upstream release**. The TUI uses them when the node has them, and
@@ -164,27 +174,28 @@ Version Info lists which of the six the connected node is missing.
 
 ## Adding the extra RPCs to your node
 
-[`node-patches/v17-extra-rpcs.patch`](node-patches/v17-extra-rpcs.patch) adds all six to a v17
-node. It only reads state the node already keeps and changes no consensus, networking or wallet
-behaviour. Its quorum figures follow the strict quorum from FeaturenetUpgrade2, as consensus does.
+[`node-patches/v18-extra-rpcs.patch`](node-patches/v18-extra-rpcs.patch) adds all six to a v18
+node (`v17-extra-rpcs.patch` is kept for v17 nodes). It only reads state the node already keeps
+and changes no consensus, networking or wallet behaviour. Its quorum figures follow the strict
+quorum from FeaturenetUpgrade2, as consensus does.
 It touches six files: `tenderlink/src/lib.rs`, `wallet/src/lib.rs`, and in `zebra-crosslink/`:
 `zebra-crosslink/src/lib.rs`, `zebra-rpc/src/methods.rs`, `zebra-state/src/crosslink.rs` and
 `zebra-state/src/new_network/bft.rs`.
 
-1. Get the v17 source, or go to your existing checkout:
+1. Get the v18 source, or go to your existing checkout:
 
    ```sh
    git clone https://github.com/ShieldedLabs/crosslink_monolith
    cd crosslink_monolith
-   git checkout v17_rc1
+   git checkout v18
    ```
 
 2. Apply the patch from the repository root. The check step changes nothing; it only reports
    whether the patch fits:
 
    ```sh
-   git apply --check /path/to/crosslink-tui/node-patches/v17-extra-rpcs.patch
-   git apply /path/to/crosslink-tui/node-patches/v17-extra-rpcs.patch
+   git apply --check /path/to/crosslink-tui/node-patches/v18-extra-rpcs.patch
+   git apply /path/to/crosslink-tui/node-patches/v18-extra-rpcs.patch
    ```
 
    If your checkout has its own changes in those files and the check fails, try
@@ -246,17 +257,22 @@ A later node release may already include these RPCs, or may need the patch updat
   writes to its log at startup. With systemd, the TUI reads the journal forward from the moment the
   node started, which stays fast however busy the journal is.
 - **Node release:** when the build commit is an upstream release tag, the TUI names the release
-  (`v17_rc1 (commit 97e7f10)`); a build with local patches on top of a tag still reports the tag's
+  (`v18 (commit 8ea914c)`); a build with local patches on top of a tag still reports the tag's
   commit. Without the log (a remote node), the release is inferred from the protocol version and the
-  upgrades the node schedules (`v17 or later`). `zebrad build` (`v6.2.3`) is the Zebra version
+  upgrades the node schedules (`v18 or later`). `zebrad build` (`v6.2.3`) is the Zebra version
   Crosslink is based on, not the Crosslink release.
+- **Network peers:** v18 has no RPC for its peers, so Peers and Sync reads the status line the node
+  logs every few seconds. Like the startup facts, it needs the TUI on the node's machine or
+  `--log-file`; against a remote node it shows none. Peers are compared by height only: a peer at
+  your finalized height has not been checked to hold the same block, but with finality working
+  every honest node agrees on the finalized blocks.
 - **One outbound request:** the Top Stakers page fetches the public roster document at
   `https://ctaz.cash/v14/api/roster` about every 45 seconds. It is a plain GET that sends no node or
   wallet data, but that site sees your IP address. Every other panel talks only to your own node.
 
 ## Releases
 
-Pushing a tag such as `v0.5.0` runs `.github/workflows/release.yml`, which builds Linux (x86_64,
+Pushing a tag such as `v0.5.1` runs `.github/workflows/release.yml`, which builds Linux (x86_64,
 aarch64), macOS (Apple Silicon, Intel) and Windows (x86_64) binaries and attaches them to a GitHub
 release for that tag.
 

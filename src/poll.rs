@@ -21,6 +21,8 @@ const MINING_EVERY: Duration = Duration::from_secs(60);
 /// Block spacing for ETAs, re-measured every `SPACING_EVERY` over this many blocks.
 const SPACING_BLOCKS: u64 = 500;
 const SPACING_EVERY: Duration = Duration::from_secs(600);
+/// The v18 network status comes from the node log, which it updates every few seconds.
+const NET_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Default, Clone)]
 pub struct Snap {
@@ -31,6 +33,9 @@ pub struct Snap {
     pub mining: Value,
     pub mempool: Value,
     pub peers: Value,
+    /// Peers on the v18 network, from the node log. `getpeerinfo` lists only the legacy Zcash
+    /// network, which v18 turns off by default.
+    pub net: Option<node::NetView>,
     pub wallet: Value,
     pub roster: Value,
     /// `ctaz.cash` roster document. `staking.finalizers` is the bonded-stake board.
@@ -106,6 +111,7 @@ impl Poller {
         let board_slot: Arc<Mutex<Option<Result<Value, String>>>> = Arc::default();
         let mut last_mining = None::<Instant>;
         let mut last_spacing = None::<Instant>;
+        let mut last_net = None::<Instant>;
         let mining_busy = Arc::new(AtomicBool::new(false));
         let mining_slot: Arc<Mutex<Option<mining::MiningHealth>>> = Arc::default();
         // The tracker keeps its block cache between passes, so only new blocks are fetched.
@@ -208,6 +214,10 @@ impl Poller {
                 });
             }
 
+            if last_net.is_none_or(|t| t.elapsed() > NET_EVERY) {
+                s.net = node::net_view(&self.log_source);
+                last_net = Some(Instant::now());
+            }
             self.fetch_rpc(&mut s);
             if s.rpc_error.is_none() {
                 record_finality(&mut s);
@@ -252,7 +262,11 @@ impl Poller {
         s.mining = self.get(s, "getmininginfo", json!([]));
         s.mempool = self.get(s, "getmempoolinfo", json!([]));
         s.peers = self.get(s, "getpeerinfo", json!([]));
-        s.roster = self.get(s, "get_tfl_roster_zats", json!([]));
+        // From v18 this one also fills in finalizer_address, which get_tfl_roster_zats leaves null.
+        s.roster = self.get(s, "get_tfl_roster_with_addresses", json!([]));
+        if s.roster.is_null() {
+            s.roster = self.get(s, "get_tfl_roster_zats", json!([]));
+        }
         s.positions = self.get(s, "wallet_staking_positions", json!([]));
         s.wallet = self.get(s, "get_wallet_sync_status", json!([]));
         s.wallet_fallback = s.missing_rpcs.contains("get_wallet_sync_status");

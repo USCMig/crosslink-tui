@@ -3,6 +3,9 @@
 //! v15 brought FeaturenetUpgrade1 at PoW height 55,296: new bonds must be a power of 10 zats, and
 //! `staking_command` became `wallet_staking_action`. v17 brings FeaturenetUpgrade2 at 165,000: BFT
 //! decides by a strict two-thirds quorum, and fat pointers and carried headers are checked harder.
+//! v18 brings FeaturenetUpgrade3 at 189,000: a staking action on an existing bond names the bond's
+//! current version, the txid of the last transaction that created or acted on it (the node's wallet
+//! fills it in). v18 also replaces the peer-to-peer network, and a v18 node cannot talk to a v17 one.
 //! A node that does not know an upgrade is cut off by its peers once the chain reaches it.
 
 use serde_json::Value;
@@ -20,6 +23,7 @@ pub struct Fork {
 pub const FORKS: &[Fork] = &[
     Fork { name: "FeaturenetUpgrade1", height: 55_296, release: "v15", protocol: 170_165 },
     Fork { name: "FeaturenetUpgrade2", height: 165_000, release: "v17", protocol: 170_166 },
+    Fork { name: "FeaturenetUpgrade3", height: 189_000, release: "v18", protocol: 170_167 },
 ];
 
 const UPGRADE2: &Fork = &FORKS[1];
@@ -51,6 +55,12 @@ pub fn node_is_v15(info: &Value, chain: &Value) -> bool {
     knows(info, chain, &FORKS[0])
 }
 
+/// True when the node runs v18 or later, whose peers are on the new network rather than the legacy
+/// Zcash one that `getpeerinfo` reports.
+pub fn node_is_v18(info: &Value, chain: &Value) -> bool {
+    knows(info, chain, &FORKS[2])
+}
+
 /// Where the chain's own activation height is known, it wins over the built-in one.
 fn fork_height(chain: &Value, fork: &Fork) -> u64 {
     scheduled(chain, fork).map_or(fork.height, |u| u.height)
@@ -66,6 +76,8 @@ pub fn strict_quorum(chain: &Value, finalized: Option<u64>) -> bool {
 /// Commits of the upstream release tags (`ShieldedLabs/crosslink_monolith`). Where two tags share a
 /// commit, the final release is listed first so it wins.
 const RELEASES: &[(&str, &str)] = &[
+    ("v18", "8ea914c0c6a351147474f3ec71e01b14ca30c3fd"),
+    ("v17", "3fb7a038d69d3681f4e22e44e240a0f032b2ad53"),
     ("v17_rc1", "97e7f10ef673b14c114cb7c94f5a94986347a429"),
     ("v16", "1dd0b12ddea75dfb0f8f8749b900c9dbb35eb353"),
     ("v15", "68a076cf3c866c339a89b5684eccea64a4229d7a"),
@@ -79,7 +91,7 @@ const RELEASES: &[(&str, &str)] = &[
     ("s2v8", "52082e07d8326dda47c69f2994d68e2088aff778"),
 ];
 
-/// The newest release family the node belongs to, from the forks it knows ("v17", "v15"), or
+/// The newest release family the node belongs to, from the forks it knows ("v18", "v15"), or
 /// `None` when it predates them all.
 fn family(info: &Value, chain: &Value) -> Option<&'static str> {
     FORKS.iter().rev().find(|f| knows(info, chain, f)).map(|f| f.release)
@@ -244,6 +256,10 @@ mod tests {
         assert_eq!(node_release(Some("97e7f10"), &v17.0, &v17.1), "v17_rc1 (commit 97e7f10)");
         assert!(node_release(Some("1234567"), &v17.0, &v17.1).starts_with("v17 or later, untagged"));
         assert_eq!(node_release_short(Some("1234567"), &v17.0, &v17.1).as_deref(), Some("v17+"));
+        assert_eq!(node_release(Some("3fb7a03"), &v17.0, &v17.1), "v17 (commit 3fb7a03)");
+        let v18 = (json!({"protocolversion": 170167}), json!({}));
+        assert_eq!(node_release(Some("8ea914c0"), &v18.0, &v18.1), "v18 (commit 8ea914c)");
+        assert_eq!(node_release_short(Some("1234567"), &v18.0, &v18.1).as_deref(), Some("v18+"));
     }
 
     #[test]
@@ -254,15 +270,27 @@ mod tests {
         assert!(warn && line.contains("predates v17") && line.contains("165000"), "{line}");
         let (line, warn) = status_line(&v16, &v16_chain, 166_000, None);
         assert!(warn && line.contains("network forked at 165000"), "{line}");
-        assert_eq!(needed_release(&v16, &v16_chain), Some("v17"));
+        assert_eq!(needed_release(&v16, &v16_chain), Some("v18"));
 
         let v17 = json!({"protocolversion": 170166});
         let v17_chain = chain(&[("FeaturenetUpgrade1", 55_296, "active"), ("FeaturenetUpgrade2", 165_000, "pending")]);
         let (line, warn) = status_line(&v17, &v17_chain, 131_000, None);
         assert!(!warn && line.starts_with("FeaturenetUpgrade2 at 165000 in 34000 blocks"), "{line}");
-        let (line, warn) = status_line(&v17, &v17_chain, 165_000, None);
-        assert!(!warn && line == "FeaturenetUpgrade2 active since 165000", "{line}");
-        assert_eq!(needed_release(&v17, &v17_chain), None);
+        let (line, warn) = status_line(&v17, &v17_chain, 169_000, None);
+        assert!(warn && line.contains("predates v18") && line.contains("189000 (20000 blocks"), "{line}");
+        assert_eq!(needed_release(&v17, &v17_chain), Some("v18"));
+
+        let v18 = json!({"protocolversion": 170167});
+        let v18_chain = chain(&[
+            ("FeaturenetUpgrade1", 55_296, "active"),
+            ("FeaturenetUpgrade2", 165_000, "active"),
+            ("FeaturenetUpgrade3", 189_000, "pending"),
+        ]);
+        let (line, warn) = status_line(&v18, &v18_chain, 169_000, None);
+        assert!(!warn && line.starts_with("FeaturenetUpgrade3 at 189000 in 20000 blocks"), "{line}");
+        let (line, warn) = status_line(&v18, &v18_chain, 189_000, None);
+        assert!(!warn && line == "FeaturenetUpgrade3 active since 189000", "{line}");
+        assert_eq!(needed_release(&v18, &v18_chain), None);
 
         let v14 = json!({"protocolversion": 170160});
         let (line, warn) = status_line(&v14, &json!({"upgrades": {}}), 50_000, None);
