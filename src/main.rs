@@ -38,7 +38,45 @@ const USAGE: &str = "crosslink-tui [--config PATH] [--rpc URL] [--rpc-cookie PAT
 
 Works in any terminal, including tmux:  tmux new -A -s crosslink crosslink-tui";
 
+/// Where a crash report goes: `<cache dir>/crosslink-tui/crash.log`.
+fn crash_log_path() -> PathBuf {
+    let home = || PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let cache = if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+    } else if cfg!(target_os = "macos") {
+        home().join("Library/Caches")
+    } else {
+        std::env::var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|_| home().join(".cache"))
+    };
+    cache.join("crosslink-tui").join("crash.log")
+}
+
+/// The UI owns the terminal, so a panic message printed the usual way is lost when the screen is
+/// restored. Keep it, append it to the crash log, and print it once the terminal is back.
+static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let bt = std::backtrace::Backtrace::force_capture();
+        let text = format!(
+            "{} crosslink-tui {} panicked in thread {thread}: {info}\n{bt}\n",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let path = crash_log_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(text.as_bytes());
+        }
+        *LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{info}"));
+    }));
+}
+
 fn main() {
+    install_panic_hook();
     let mut service = "zebra-crosslink".to_string();
     let mut config_arg = None;
     let mut rpc_arg = None;
@@ -133,9 +171,14 @@ fn main() {
         let stop_poller = stop.clone();
         std::thread::spawn(move || poller.run(stop_poller, move || sink.send(Box::new(ui::refresh)).is_ok()));
 
-        siv.run();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| siv.run()));
         stop.store(true, Ordering::Relaxed);
         drop(siv);
+        if ran.is_err() {
+            let msg = LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            eprintln!("crosslink-tui crashed: {msg}\nDetails and a backtrace are in {}", crash_log_path().display());
+            std::process::exit(101);
+        }
 
         let Some(p) = pending.lock().unwrap().take() else { break };
         println!("$ {}", p.cmd.join(" "));

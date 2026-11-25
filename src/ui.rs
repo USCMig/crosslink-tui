@@ -499,7 +499,9 @@ fn staking_panel(read_only: bool) -> impl View {
                     }
                 }))
                 .child(DummyView)
-                .child(Button::new("Fill max", fill_max_amount)),
+                .child(Button::new("Fill max", fill_max_amount))
+                .child(DummyView)
+                .child(Button::new("Merge notes", merge_notes)),
         )
         .child(DummyView)
         .child(heading("My bonds (wallet_staking_positions)"))
@@ -525,7 +527,10 @@ fn refresh_roster(s: &mut Cursive, snap: &Snap) {
     }
     app(s).last_roster = labels;
     s.call_on_name("roster", |v: &mut SelectView<Option<String>>| {
-        let keep = v.selected_id().unwrap_or(0);
+        // Voting power changes every block, so the list is rebuilt often. Keep the highlight on the
+        // same finalizer, not the same row: a stake or retarget goes to whatever is highlighted.
+        let keep = v.selection().and_then(|a| (*a).clone());
+        let keep_row = v.selected_id().unwrap_or(0);
         v.clear();
         if rows.is_empty() {
             v.add_item("(empty: BFT is not active yet, so there is no roster)", None);
@@ -533,7 +538,10 @@ fn refresh_roster(s: &mut Cursive, snap: &Snap) {
         for r in rows {
             v.add_item(r.label, r.address);
         }
-        let _ = v.set_selection(keep.min(v.len().saturating_sub(1)));
+        let row = keep
+            .and_then(|a| v.iter().position(|(_, x)| x.as_deref() == Some(a.as_str())))
+            .unwrap_or(keep_row.min(v.len().saturating_sub(1)));
+        let _ = v.set_selection(row);
     });
 }
 
@@ -545,7 +553,9 @@ fn refresh_bonds(s: &mut Cursive, snap: &Snap) {
     }
     app(s).last_bonds = labels;
     s.call_on_name("bonds", |v: &mut SelectView<(String, bool)>| {
-        let keep = v.selected_id().unwrap_or(0);
+        // Bond values grow every block; keep the highlight on the same bond, as for the roster.
+        let keep = v.selection().map(|x| x.0.clone()).filter(|k| !k.is_empty());
+        let keep_row = v.selected_id().unwrap_or(0);
         v.clear();
         if rows.is_empty() {
             v.add_item("(no bonds yet)", (String::new(), false));
@@ -553,7 +563,10 @@ fn refresh_bonds(s: &mut Cursive, snap: &Snap) {
         for r in rows {
             v.add_item(r.label, (r.bond_key, r.withdrawable));
         }
-        let _ = v.set_selection(keep.min(v.len().saturating_sub(1)));
+        let row = keep
+            .and_then(|k| v.iter().position(|(_, x)| x.0 == k))
+            .unwrap_or(keep_row.min(v.len().saturating_sub(1)));
+        let _ = v.set_selection(row);
     });
 }
 
@@ -680,7 +693,18 @@ fn bond_action(s: &mut Cursive, kind: &str) {
     } else {
         json!({kind: {"bond_key": bond_key}})
     };
-    confirm_staking(s, format!("{kind} for bond {}?", render::short(&bond_key, 16)), action);
+    let mut question = format!("{kind} for bond {}?", render::short(&bond_key, 16));
+    let v19 = {
+        let snap = app(s).snap.lock().unwrap();
+        crate::upgrade::node_is_v19(&snap.info, &snap.chain)
+    };
+    if kind == "WithdrawDelegationBond" && v19 {
+        question.push_str(
+            "\n\nFrom FeaturenetUpgrade4 (block 213,000) the network accepts a withdrawal only once the block\n\
+             that unbonded this bond is final. Until then the node rejects the withdrawal; try again later.",
+        );
+    }
+    confirm_staking(s, question, action);
 }
 
 fn raw_action(s: &mut Cursive) {
@@ -778,7 +802,85 @@ fn submit_staking(s: &mut Cursive, action: Value) {
                     "Staking action sent",
                     format!("The node accepted the action. Watch Staked / My bonds update once it is mined.\n\n{}", render::short(&r.to_string(), 300)),
                 ),
+                Err(e) if e.contains("in progress") => info(
+                    s,
+                    "Staking action not sent",
+                    format!(
+                        "The node wallet is still building another staking action ({e}). It builds one at \
+                         a time; a script that stakes through the same node (a stake loop) does too. \
+                         Try again in a minute or two."
+                    ),
+                ),
+                Err(e) if e.contains("Merge notes") => {
+                    // v19: a transaction spends at most a fixed number of notes; merging fixes it.
+                    s.add_layer(
+                        Dialog::text(format!("{e}\n\nMerge notes now? It combines up to 20 notes into one and pays a fee."))
+                            .title("Staking action failed")
+                            .button("Merge notes", |s| {
+                                s.pop_layer();
+                                merge_notes(s);
+                            })
+                            .dismiss_button("Close"),
+                    );
+                }
                 Err(e) => info(s, "Staking action failed", e),
+            }
+        }));
+    });
+}
+
+/// `wallet_merge_notes` (v19): combine up to 20 small shielded notes into one, so a later bond or
+/// send needs fewer inputs. It pays a fee, so it asks first.
+fn merge_notes(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
+    let v19 = {
+        let snap = app(s).snap.lock().unwrap();
+        crate::upgrade::node_is_v19(&snap.info, &snap.chain)
+    };
+    if !v19 {
+        return info(s, "Merge notes", "Merging notes needs node v19 or later (wallet_merge_notes).");
+    }
+    s.add_layer(
+        Dialog::text(
+            "Merge up to 20 of this wallet's shielded notes into one note?\n\n\
+             It pays a network fee. The merged note needs 3 confirmations before it can fund a bond or\n\
+             send, and nothing is retried automatically.",
+        )
+        .title("Merge notes")
+        .button("Merge", |s| {
+            s.pop_layer();
+            submit_merge(s);
+        })
+        .dismiss_button("Cancel")
+        .with(|d| { d.set_focus(DialogFocus::Button(1)); }),
+    );
+}
+
+fn submit_merge(s: &mut Cursive) {
+    if blocked(s) {
+        return;
+    }
+    let rpc = app(s).rpc.clone();
+    let sink = s.cb_sink().clone();
+    s.add_layer(Dialog::text("Building the merge transaction in the node wallet.\nThis can take a few minutes.").title("Merging").with_name("busy"));
+    std::thread::spawn(move || {
+        let res = rpc.call_with_timeout("wallet_merge_notes", json!([]), Duration::from_secs(600));
+        let _ = sink.send(Box::new(move |s: &mut Cursive| {
+            if s.find_name::<Dialog>("busy").is_some() {
+                s.pop_layer();
+            }
+            match res {
+                Ok(txid) => info(
+                    s,
+                    "Merge sent",
+                    format!(
+                        "Merge transaction {}.\nWait for 3 confirmations, then retry the bond or send.",
+                        render::short(txid.as_str().unwrap_or(&txid.to_string()), 64)
+                    ),
+                ),
+                Err(e) => info(s, "Merge failed", e),
             }
         }));
     });

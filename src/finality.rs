@@ -87,14 +87,19 @@ impl History {
     /// One character per bucket over the last `secs`, scaled to the largest gap shown.
     pub fn gap_sparkline(&self, now: i64, secs: i64, buckets: usize) -> Option<(String, u64)> {
         const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        let width = (secs / buckets as i64).max(1);
+        if secs <= 0 || buckets == 0 {
+            return None;
+        }
         let mut vals: Vec<Option<u64>> = vec![None; buckets];
         for x in &self.samples {
             let age = now - x.t;
             if !(0..secs).contains(&age) {
                 continue;
             }
-            let i = buckets - 1 - (age / width) as usize;
+            // Oldest at the left. Scaled over the whole window, so the index stays in range for any
+            // `secs`, also one that `buckets` does not divide (a bucket width rounded down put the
+            // oldest samples past the left edge, and the panel crashed in the TUI's first hour).
+            let i = ((secs - 1 - age) as u128 * buckets as u128 / secs as u128) as usize;
             if let Some(f) = x.finalized {
                 let g = x.pow_tip.saturating_sub(f);
                 vals[i] = Some(vals[i].map_or(g, |v: u64| v.max(g)));
@@ -203,6 +208,22 @@ mod tests {
     }
 
     #[test]
+    fn sparkline_fits_any_window() {
+        for secs in 1..=3_600i64 {
+            let mut h = History::default();
+            for t in (0..secs).step_by(7) {
+                h.push(Sample { t, bft_height: 1, pow_tip: 10 + t as u64 % 5, finalized: Some(5) });
+            }
+            let (line, _) = h.gap_sparkline(secs - 1, secs, 40).unwrap();
+            assert_eq!(line.chars().count(), 40, "{secs}");
+        }
+        let mut h = History::default();
+        h.push(s(0, 1, 10, 5));
+        assert!(h.gap_sparkline(0, 0, 40).is_none());
+        assert!(h.gap_sparkline(0, 60, 0).is_none());
+    }
+
+    #[test]
     fn reads_recency_pairs() {
         let r = json!({"finalizer_statuses": [["aa", {"no_yes_votes_in_my_height": [[4, 1], [0, 2]], "highest_round_vote": 3, "last_direct_connection_utc": 5}]]});
         let f = recent_finalizers(&r);
@@ -229,3 +250,4 @@ mod tests {
         }
     }
 }
+
