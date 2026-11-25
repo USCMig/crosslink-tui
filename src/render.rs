@@ -24,8 +24,13 @@ pub fn zats(v: Option<u64>) -> String {
     }
 }
 
+/// The first `n` characters of `s`, with `...` when it is longer. Counted in characters, not bytes,
+/// so text from the node with non-ASCII in it cannot split a character (which panics).
 pub fn short(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}...", &s[..n]) }
+    match s.char_indices().nth(n) {
+        None => s.to_string(),
+        Some((i, _)) => format!("{}...", &s[..i]),
+    }
 }
 
 pub fn age(secs: i64) -> String {
@@ -410,6 +415,13 @@ pub fn staking(snap: &Snap) -> String {
         let _ = writeln!(o, "Bond rule (since v15): a new bond must be a power of 10 zats (1, 10, 100, 1000 cTAZ...).");
         let _ = writeln!(o, "Unbonding and withdrawing take any amount. Fill max picks the largest bond that fits.");
     }
+    if crate::upgrade::node_is_v19(&snap.info, &snap.chain) {
+        let _ = writeln!(o, "Withdraw rule (from FeaturenetUpgrade4 at 213,000): a bond can be withdrawn only once the");
+        let _ = writeln!(o, "block that unbonded it is final, and still in a later staking period than the unbond. While");
+        let _ = writeln!(o, "finality is stalled, withdrawals wait. `withdrawable` in the list below does not check this.");
+        let _ = writeln!(o, "A bond or send can spend at most a fixed number of notes; if one fails for that, Merge notes");
+        let _ = writeln!(o, "combines up to 20 into one (3 confirmations before it can be used).");
+    }
     let (up, warn) = crate::upgrade::status_line(&snap.info, &snap.chain, h, snap.avg_block_secs);
     if warn {
         let _ = writeln!(o, "{up}");
@@ -459,7 +471,9 @@ pub struct RosterRow {
 }
 
 pub fn roster_rows(snap: &Snap) -> Vec<RosterRow> {
-    let list = snap.roster.as_array().cloned().unwrap_or_default();
+    let mut list = snap.roster.as_array().cloned().unwrap_or_default();
+    // The node's order is not by stake and changes over time; largest first, ties by key.
+    list.sort_by(|a, b| u(b, "voting_power").cmp(&u(a, "voting_power")).then_with(|| s(a, "pub_key").cmp(s(b, "pub_key"))));
     let total: u64 = list.iter().filter_map(|m| u(m, "voting_power")).sum();
     let mine = snap.finalizer_address.as_deref();
     list.iter()
@@ -1412,6 +1426,27 @@ mod tests {
         let text = top_stakers(&snap).source().to_string();
         assert!(text.contains("EXPIRED"), "{text}");
         assert!(text.contains("10m ago"), "{text}");
+    }
+
+    #[test]
+    fn short_counts_characters() {
+        assert_eq!(short("abcdef", 3), "abc...");
+        assert_eq!(short("abc", 3), "abc");
+        assert_eq!(short("ééééé", 2), "éé...");
+        assert_eq!(short("a—b", 2), "a—...");
+    }
+
+    #[test]
+    fn roster_rows_go_largest_first() {
+        let mut snap = Snap::default();
+        snap.roster = json!([
+            {"pub_key": "aa", "voting_power": 5, "finalizer_address": "zfinv1a"},
+            {"pub_key": "bb", "voting_power": 50, "finalizer_address": "zfinv1b"},
+            {"pub_key": "cc", "voting_power": 5, "finalizer_address": null},
+        ]);
+        let rows = roster_rows(&snap);
+        let addrs: Vec<Option<&str>> = rows.iter().map(|r| r.address.as_deref()).collect();
+        assert_eq!(addrs, [Some("zfinv1b"), Some("zfinv1a"), None]);
     }
 
     #[test]
